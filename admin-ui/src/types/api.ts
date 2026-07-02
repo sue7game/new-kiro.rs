@@ -370,6 +370,8 @@ export interface ClientKeyItem {
   totalCacheReadTokens: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
+  /** 每分钟请求数上限；未设置表示不限速 */
+  rpmLimit?: number
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
   isSystem: boolean
 }
@@ -383,6 +385,7 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  rpmLimit?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -397,6 +400,8 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  /** 不传不修改，0 表示清空限制 */
+  rpmLimit?: number
 }
 
 // ============ 用量统计 ============

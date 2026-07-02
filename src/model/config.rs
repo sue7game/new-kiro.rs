@@ -4,6 +4,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// 单请求额外重试轮数上限，避免错误配置导致请求被长时间阻塞。
+pub const MAX_REQUEST_RETRY: u32 = 10;
+
+/// 单轮最多尝试凭据数量上限；0 表示不限制，由运行时按可用凭据数计算。
+pub const MAX_RETRY_CREDENTIALS: usize = 1_000;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -123,9 +129,19 @@ pub struct Config {
     #[serde(default = "default_update_auto_apply_time")]
     pub update_auto_apply_time: String,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority"、"balanced" 或 "round-robin"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    /// 请求失败后的额外重试轮数。
+    ///
+    /// 语义参考 CLIProxyAPI：0 表示只执行初始一轮；2 表示初始一轮 + 额外 2 轮。
+    #[serde(default = "default_request_retry", alias = "request-retry")]
+    pub request_retry: u32,
+
+    /// 每轮最多尝试多少个不同凭据；0 表示尝试当前可访问范围内所有可用凭据。
+    #[serde(default, alias = "max-retry-credentials")]
+    pub max_retry_credentials: usize,
 
     /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
     ///
@@ -213,6 +229,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_request_retry() -> u32 {
+    0
+}
+
 fn default_account_throttle_failover() -> bool {
     true
 }
@@ -273,6 +293,8 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            request_retry: default_request_retry(),
+            max_retry_credentials: 0,
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             extract_thinking: default_extract_thinking(),
@@ -323,6 +345,22 @@ impl Config {
         // 空字符串导致难以诊断的错误。
         if config.update_auto_apply_time.trim().is_empty() {
             config.update_auto_apply_time = default_update_auto_apply_time();
+        }
+        if config.request_retry > MAX_REQUEST_RETRY {
+            tracing::warn!(
+                "requestRetry={} 超过上限 {}，已按上限生效",
+                config.request_retry,
+                MAX_REQUEST_RETRY
+            );
+            config.request_retry = MAX_REQUEST_RETRY;
+        }
+        if config.max_retry_credentials > MAX_RETRY_CREDENTIALS {
+            tracing::warn!(
+                "maxRetryCredentials={} 超过上限 {}，已按上限生效",
+                config.max_retry_credentials,
+                MAX_RETRY_CREDENTIALS
+            );
+            config.max_retry_credentials = MAX_RETRY_CREDENTIALS;
         }
 
         Ok(config)

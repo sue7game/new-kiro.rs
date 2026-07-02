@@ -128,6 +128,7 @@ import {
   enableOverageForAllCapable,
   exportKamCredentials,
   updateAdminKey,
+  type LoadBalancingMode,
 } from "@/api/credentials";
 import {
   extractErrorMessage,
@@ -137,6 +138,18 @@ import {
   overageFailureMessage,
 } from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
+
+const loadBalancingLabels: Record<LoadBalancingMode, string> = {
+  priority: "优先级",
+  balanced: "均衡负载",
+  "round-robin": "轮询",
+};
+
+function nextLoadBalancingMode(mode?: LoadBalancingMode): LoadBalancingMode {
+  if (mode === "priority") return "balanced";
+  if (mode === "balanced") return "round-robin";
+  return "priority";
+}
 
 interface DashboardProps {
   onLogout: () => void;
@@ -1063,11 +1076,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || "priority";
-    const next = cur === "priority" ? "balanced" : "priority";
+    const next = nextLoadBalancingMode(cur);
     setLoadBalancingMode(next, {
       onSuccess: () =>
         toast.success(
-          `已切换到${next === "priority" ? "优先级模式" : "均衡负载模式"}`,
+          `已切换到${loadBalancingLabels[next]}模式`,
         ),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     });
@@ -1131,9 +1144,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <Activity className="h-3.5 w-3.5" />
                 {isLoadingMode
                   ? "加载中…"
-                  : loadBalancingData?.mode === "priority"
-                    ? "优先级"
-                    : "均衡负载"}
+                  : loadBalancingLabels[loadBalancingData?.mode || "priority"]}
               </Button>
               <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
                 <a

@@ -55,6 +55,9 @@ pub struct ClientKey {
     /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 每分钟请求数上限。None 表示不限速。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
     /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -156,7 +159,24 @@ impl ClientKeyManager {
         description: Option<String>,
         group: Option<String>,
     ) -> ClientKey {
-        self.create_with_key(name, description, group, generate_client_key())
+        self.create_with_rpm_limit(name, description, group, None)
+    }
+
+    /// 创建新 Key，并设置可选 RPM 上限。
+    pub fn create_with_rpm_limit(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        rpm_limit: Option<u32>,
+    ) -> ClientKey {
+        self.create_with_key_and_rpm_limit(
+            name,
+            description,
+            group,
+            generate_client_key(),
+            rpm_limit,
+        )
     }
 
     /// 用指定明文创建 Key（仅供首次启动 bootstrap 用，把 config.json apiKey 直接导入为第一条分发密钥）。
@@ -168,10 +188,25 @@ impl ClientKeyManager {
         group: Option<String>,
         plaintext: String,
     ) -> ClientKey {
+        self.create_with_key_and_rpm_limit(name, description, group, plaintext, None)
+    }
+
+    fn create_with_key_and_rpm_limit(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        plaintext: String,
+        rpm_limit: Option<u32>,
+    ) -> ClientKey {
         let mut inner = self.inner.write();
         // 防止 bootstrap 重复导入同一明文
         if let Some(&id) = inner.by_key.get(&plaintext) {
-            return inner.entries.get(&id).cloned().expect("by_key 与 entries 应一致");
+            return inner
+                .entries
+                .get(&id)
+                .cloned()
+                .expect("by_key 与 entries 应一致");
         }
         let id = inner.next_id;
         inner.next_id += 1;
@@ -190,6 +225,7 @@ impl ClientKeyManager {
             total_cache_read_tokens: 0,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
+            rpm_limit: normalize_rpm_limit(rpm_limit),
             is_system: false,
         };
         inner.by_key.insert(plaintext, id);
@@ -263,6 +299,7 @@ impl ClientKeyManager {
                     total_cache_read_tokens: 0,
                     total_credits: 0.0,
                     group: None,
+                    rpm_limit: None,
                     is_system: true,
                 };
                 inner.by_key.insert(plaintext, id);
@@ -312,6 +349,7 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
+        rpm_limit: Option<Option<u32>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -325,6 +363,9 @@ impl ClientKeyManager {
                 if let Some(g) = group {
                     e.group = g.filter(|s| !s.trim().is_empty());
                 }
+                if let Some(limit) = rpm_limit {
+                    e.rpm_limit = normalize_rpm_limit(limit);
+                }
                 true
             }
             None => false,
@@ -337,7 +378,16 @@ impl ClientKeyManager {
 
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
-        self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.group.clone())
+    }
+
+    /// 返回指定 Key 的 RPM 上限。None 表示未设置或 Key 不存在。
+    pub fn rpm_limit_of(&self, id: u64) -> Option<u32> {
+        self.inner.read().entries.get(&id).and_then(|e| e.rpm_limit)
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -448,31 +498,28 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`
+    /// 校验 Key，命中且未禁用则返回 id；不更新使用统计。
+    ///
+    /// RPM 限流需要先完成鉴权，再在允许通过后触发 `touch`，避免被拒绝的请求计入成功调用数。
+    pub fn verify(&self, presented: &str) -> Option<u64> {
+        let inner = self.inner.read();
+        find_active_key_id(&inner, presented)
+    }
+
+    /// 标记 Key 已通过一次请求，更新 `last_used_at`/`total_calls`。
+    pub fn touch(&self, id: u64) -> bool {
+        let mut inner = self.inner.write();
+        touch_entry(&mut inner, id)
+    }
+
+    /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`。
     ///
     /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
     /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
-        if !presented.starts_with(CLIENT_KEY_PREFIX) {
-            return None;
-        }
         let mut inner = self.inner.write();
-        // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
-        let mut hit_id: Option<u64> = None;
-        for (id, ck) in inner.entries.iter() {
-            if ck.disabled {
-                continue;
-            }
-            if ck.key.as_bytes().ct_eq(presented.as_bytes()).into() {
-                hit_id = Some(*id);
-                // 不 break，继续完整扫描以保持常量时间
-            }
-        }
-        let id = hit_id?;
-        if let Some(entry) = inner.entries.get_mut(&id) {
-            entry.total_calls += 1;
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
-        }
+        let id = find_active_key_id(&inner, presented)?;
+        touch_entry(&mut inner, id);
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
         Some(id)
     }
@@ -503,7 +550,12 @@ impl ClientKeyManager {
 
     /// 获取统计后的 active Key 数（未禁用）
     pub fn active_count(&self) -> usize {
-        self.inner.read().entries.values().filter(|e| !e.disabled).count()
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| !e.disabled)
+            .count()
     }
 }
 
@@ -518,10 +570,43 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+fn normalize_rpm_limit(rpm_limit: Option<u32>) -> Option<u32> {
+    rpm_limit.filter(|limit| *limit > 0)
+}
+
+fn find_active_key_id(inner: &Inner, presented: &str) -> Option<u64> {
+    if !presented.starts_with(CLIENT_KEY_PREFIX) {
+        return None;
+    }
+    // 扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
+    let mut hit_id: Option<u64> = None;
+    for (id, ck) in inner.entries.iter() {
+        if ck.disabled {
+            continue;
+        }
+        if ck.key.as_bytes().ct_eq(presented.as_bytes()).into() {
+            hit_id = Some(*id);
+            // 不 break，继续完整扫描以保持常量时间
+        }
+    }
+    hit_id
+}
+
+fn touch_entry(inner: &mut Inner, id: u64) -> bool {
+    if let Some(entry) = inner.entries.get_mut(&id) {
+        if entry.disabled {
+            return false;
+        }
+        entry.total_calls += 1;
+        entry.last_used_at = Some(Utc::now().to_rfc3339());
+        return true;
+    }
+    false
+}
+
 /// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let body: String = (0..32)
         .map(|_| {
             let idx = fastrand::usize(..CHARSET.len());
@@ -623,6 +708,41 @@ mod tests {
     }
 
     #[test]
+    fn create_with_rpm_limit_normalizes_zero() {
+        let mgr = ClientKeyManager::new();
+        let limited = mgr.create_with_rpm_limit("limited".into(), None, None, Some(120));
+        let unlimited = mgr.create_with_rpm_limit("unlimited".into(), None, None, Some(0));
+
+        assert_eq!(mgr.rpm_limit_of(limited.id), Some(120));
+        assert_eq!(mgr.rpm_limit_of(unlimited.id), None);
+    }
+
+    #[test]
+    fn update_meta_can_change_and_clear_rpm_limit() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+
+        assert!(mgr.update_meta(entry.id, None, None, None, Some(Some(30))));
+        assert_eq!(mgr.rpm_limit_of(entry.id), Some(30));
+
+        assert!(mgr.update_meta(entry.id, None, None, None, Some(None)));
+        assert_eq!(mgr.rpm_limit_of(entry.id), None);
+    }
+
+    #[test]
+    fn missing_rpm_limit_in_old_json_defaults_to_none() {
+        let json = r#"{
+            "id": 1,
+            "key": "csk_abcdefghijklmnop",
+            "name": "old",
+            "createdAt": "2026-01-01T00:00:00Z"
+        }"#;
+
+        let parsed: ClientKey = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.rpm_limit, None);
+    }
+
+    #[test]
     fn ensure_system_key_uses_id_zero() {
         let mgr = ClientKeyManager::new();
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
@@ -643,7 +763,10 @@ mod tests {
         // 修复后启动：应迁移到 id=0
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
         assert!(mgr.is_system(0));
-        assert!(!mgr.list().iter().any(|k| k.id == 1 && k.key == "sk-kiro-abc"));
+        assert!(!mgr
+            .list()
+            .iter()
+            .any(|k| k.id == 1 && k.key == "sk-kiro-abc"));
     }
 
     #[test]

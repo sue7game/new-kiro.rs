@@ -192,6 +192,7 @@ async fn main() {
     ));
     let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
     usage_aggregator.rebuild_from_logs(&cache_dir);
+    let rate_limiter = std::sync::Arc::new(admin::RateLimiter::new());
 
     // 账号分组注册表（持久化到 groups.json）。
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
@@ -267,6 +268,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        Some(rate_limiter.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

@@ -5,12 +5,13 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, HeaderValue, header},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::rate_limit::{RateLimitDecision, SharedRateLimiter};
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
@@ -48,6 +49,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 客户端 Key RPM 限流器（单机内存）。
+    pub rate_limiter: Option<SharedRateLimiter>,
 }
 
 impl AppState {
@@ -62,6 +65,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            rate_limiter: None,
         }
     }
 
@@ -95,6 +99,12 @@ impl AppState {
         self.trace_store = store;
         self
     }
+
+    /// 注入客户端 Key RPM 限流器。
+    pub fn with_rate_limiter(mut self, limiter: Option<SharedRateLimiter>) -> Self {
+        self.rate_limiter = limiter;
+        self
+    }
 }
 
 /// API Key 认证中间件
@@ -116,7 +126,19 @@ pub async fn auth_middleware(
 
     // 所有 Key 统一走客户端 Key 管理器校验
     if let Some(mgr) = &state.client_keys {
-        if let Some(id) = mgr.verify_and_touch(&presented) {
+        if let Some(id) = mgr.verify(&presented) {
+            let rpm_limit = mgr.rpm_limit_of(id);
+            if let Some(limiter) = &state.rate_limiter {
+                if let RateLimitDecision::Limited { retry_after_secs } =
+                    limiter.check(id, rpm_limit)
+                {
+                    return rate_limit_response(retry_after_secs);
+                }
+            }
+            if !mgr.touch(id) {
+                let error = ErrorResponse::authentication_error();
+                return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+            }
             let group = mgr.group_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
@@ -129,6 +151,15 @@ pub async fn auth_middleware(
 
     let error = ErrorResponse::authentication_error();
     (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+}
+
+fn rate_limit_response(retry_after_secs: u64) -> Response {
+    let error = ErrorResponse::new("rate_limit_error", "RPM limit exceeded for this API key");
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// CORS 中间件层

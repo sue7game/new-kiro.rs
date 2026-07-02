@@ -10,13 +10,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
@@ -26,7 +26,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{Config, MAX_REQUEST_RETRY, MAX_RETRY_CREDENTIALS};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -883,6 +883,12 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 请求失败后的额外重试轮数（运行时可修改）。
+    request_retry: AtomicU32,
+    /// 每轮最多尝试的不同凭据数量；0 表示不限制（运行时可修改）。
+    max_retry_credentials: AtomicUsize,
+    /// round-robin 模式的游标，按 group + model + priority 隔离。
+    round_robin_cursors: Mutex<HashMap<String, usize>>,
     /// 账号级 429 风控故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
@@ -1041,6 +1047,8 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let request_retry = config.request_retry;
+        let max_retry_credentials = config.max_retry_credentials;
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let manager = Self {
@@ -1054,6 +1062,9 @@ impl MultiTokenManager {
             persist_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            request_retry: AtomicU32::new(request_retry),
+            max_retry_credentials: AtomicUsize::new(max_retry_credentials),
+            round_robin_cursors: Mutex::new(HashMap::new()),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
@@ -1132,14 +1143,67 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 获取当前请求可用凭据数量。
+    ///
+    /// 该计数会应用模型与分组隔离，用于计算每轮最多可尝试的凭据数量。
+    pub fn available_count_for_request(&self, model: Option<&str>, group: Option<&str>) -> usize {
+        self.available_count_for_request_excluding(model, group, &HashSet::new())
+    }
+
+    /// 获取当前请求在排除指定凭据后的可用凭据数量。
+    pub fn available_count_for_request_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> usize {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| {
+                !excluded_ids.contains(&e.id)
+                    && !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && credential_matches_request(&e.credentials, model, group)
+            })
+            .count()
+    }
+
+    fn round_robin_key(model: Option<&str>, group: Option<&str>, priority: u32) -> String {
+        let group = group
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("*");
+        let model = model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("*");
+        format!("group={group}|model={model}|priority={priority}")
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
     /// - balanced 模式：均衡选择可用凭据
+    /// - round-robin 模式：按优先级分桶，同优先级内轮询
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_excluding(model, group, &HashSet::new())
+    }
+
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1147,6 +1211,9 @@ impl MultiTokenManager {
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
+                if excluded_ids.contains(&e.id) {
+                    return false;
+                }
                 if e.disabled {
                     return false;
                 }
@@ -1170,6 +1237,22 @@ impl MultiTokenManager {
         let mode = mode.as_str();
 
         match mode {
+            "round-robin" => {
+                let priority = available.iter().map(|e| e.credentials.priority).min()?;
+                let mut bucket: Vec<_> = available
+                    .iter()
+                    .filter(|e| e.credentials.priority == priority)
+                    .copied()
+                    .collect();
+                bucket.sort_by_key(|e| e.id);
+                let key = Self::round_robin_key(model, group, priority);
+                let mut cursors = self.round_robin_cursors.lock();
+                let cursor = cursors.entry(key).or_insert(0);
+                let index = *cursor % bucket.len();
+                *cursor = cursor.saturating_add(1);
+                let entry = bucket[index];
+                Some((entry.id, entry.credentials.clone()))
+            }
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
@@ -1197,7 +1280,36 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_exclusions(model, group, &HashSet::new(), true)
+            .await
+    }
+
+    /// 获取 API 调用上下文，并排除本轮已经尝试过的凭据。
+    ///
+    /// `excluded_ids` 只影响本次调度选择，不会修改凭据状态；用于 429 等可切换
+    /// 错误在单轮内避免反复命中同一凭据。
+    pub async fn acquire_context_excluding(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_exclusions(model, group, excluded_ids, excluded_ids.is_empty())
+            .await
+    }
+
+    async fn acquire_context_with_exclusions(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        update_current_id: bool,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1212,11 +1324,12 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let mode = self.load_balancing_mode.lock().clone();
+                let is_reselecting_mode = matches!(mode.as_str(), "balanced" | "round-robin");
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
+                // balanced / round-robin 模式：每次请求都重新选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if is_reselecting_mode {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -1226,6 +1339,7 @@ impl MultiTokenManager {
                         .iter()
                         .find(|e| {
                             e.id == current_id
+                                && !excluded_ids.contains(&e.id)
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && credential_matches_request(&e.credentials, model, group)
@@ -1236,11 +1350,12 @@ impl MultiTokenManager {
                 if let Some(hit) = current_hit {
                     hit
                 } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
+                    // 当前凭据不可用或需要重新选择，根据负载均衡策略选择
+                    let mut best =
+                        self.select_next_credential_excluding(model, group, excluded_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
+                    if best.is_none() && excluded_ids.is_empty() {
                         let mut entries = self.entries.lock();
                         if entries.iter().any(|e| {
                             e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
@@ -1256,14 +1371,16 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, group);
+                            best =
+                                self.select_next_credential_excluding(model, group, excluded_ids);
                         }
                     }
 
                     if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
+                        if update_current_id {
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                        }
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
@@ -2136,7 +2253,10 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|e| {
                     !e.disabled
-                        && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
+                        && !e
+                            .throttled_until
+                            .map(|t| t > throttled_now)
+                            .unwrap_or(false)
                 })
                 .count()
         }
@@ -2453,10 +2573,7 @@ impl MultiTokenManager {
     /// 复用 [`Self::get_usage_limits_for`] 的 token 准备流程：API Key 凭据直接用
     /// kiroApiKey；OAuth 凭据按需在 `refresh_lock` 内刷新并持久化。返回的凭据是
     /// 刷新后重新读取的最新快照，调用方据此构造请求。
-    async fn prepare_request_token(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<(String, KiroCredentials)> {
+    async fn prepare_request_token(&self, id: u64) -> anyhow::Result<(String, KiroCredentials)> {
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -2843,8 +2960,11 @@ impl MultiTokenManager {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
             }
             if let Some(g) = groups {
-                entry.credentials.groups =
-                    g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                entry.credentials.groups = g
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
@@ -3114,47 +3234,145 @@ impl MultiTokenManager {
         self.load_balancing_mode.lock().clone()
     }
 
-    fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
+    /// 获取请求失败后的额外重试轮数。
+    pub fn get_request_retry(&self) -> u32 {
+        self.request_retry.load(Ordering::Relaxed)
+    }
+
+    /// 获取每轮最多尝试的不同凭据数量；0 表示每轮尝试所有可用凭据。
+    pub fn get_max_retry_credentials(&self) -> usize {
+        self.max_retry_credentials.load(Ordering::Relaxed)
+    }
+
+    /// 计算当前请求每轮最多尝试的凭据数量。
+    pub fn credential_limit_per_retry_round(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let available = self.available_count_for_request(model, group).max(1);
+        let configured = self.get_max_retry_credentials();
+        if configured > 0 {
+            configured.min(available)
+        } else {
+            available
+        }
+    }
+
+    fn persist_load_balancing_config(
+        &self,
+        mode: Option<&str>,
+        request_retry: Option<u32>,
+        max_retry_credentials: Option<usize>,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
 
         let config_path = match self.config.config_path() {
             Some(path) => path.to_path_buf(),
             None => {
-                tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
+                tracing::warn!("配置文件路径未知，负载均衡配置仅在当前进程生效");
                 return Ok(());
             }
         };
 
         let mut config = Config::load(&config_path)
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.load_balancing_mode = mode.to_string();
+        if let Some(mode) = mode {
+            config.load_balancing_mode = mode.to_string();
+        }
+        if let Some(request_retry) = request_retry {
+            config.request_retry = request_retry;
+        }
+        if let Some(max_retry_credentials) = max_retry_credentials {
+            config.max_retry_credentials = max_retry_credentials;
+        }
         config
             .save()
-            .with_context(|| format!("持久化负载均衡模式失败: {}", config_path.display()))?;
+            .with_context(|| format!("持久化负载均衡配置失败: {}", config_path.display()))?;
 
+        Ok(())
+    }
+
+    fn validate_load_balancing_mode(mode: &str) -> anyhow::Result<()> {
+        if mode != "priority" && mode != "balanced" && mode != "round-robin" {
+            anyhow::bail!("无效的负载均衡模式: {}", mode);
+        }
         Ok(())
     }
 
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        // 验证模式值
-        if mode != "priority" && mode != "balanced" {
-            anyhow::bail!("无效的负载均衡模式: {}", mode);
+        self.set_load_balancing_config(Some(mode), None, None)
+    }
+
+    /// 设置负载均衡与重试调度配置（Admin API）。
+    ///
+    /// 任一参数为 `None` 表示不修改对应字段。
+    pub fn set_load_balancing_config(
+        &self,
+        mode: Option<String>,
+        request_retry: Option<u32>,
+        max_retry_credentials: Option<usize>,
+    ) -> anyhow::Result<()> {
+        if let Some(mode) = mode.as_deref() {
+            Self::validate_load_balancing_mode(mode)?;
+        }
+        if let Some(value) = request_retry {
+            if value > MAX_REQUEST_RETRY {
+                anyhow::bail!(
+                    "requestRetry 不能超过 {}，当前为 {}",
+                    MAX_REQUEST_RETRY,
+                    value
+                );
+            }
+        }
+        if let Some(value) = max_retry_credentials {
+            if value > MAX_RETRY_CREDENTIALS {
+                anyhow::bail!(
+                    "maxRetryCredentials 不能超过 {}，当前为 {}",
+                    MAX_RETRY_CREDENTIALS,
+                    value
+                );
+            }
         }
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
+        if mode.is_none() && request_retry.is_none() && max_retry_credentials.is_none() {
             return Ok(());
         }
 
-        *self.load_balancing_mode.lock() = mode.clone();
+        let previous_mode = self.get_load_balancing_mode();
+        let previous_request_retry = self.get_request_retry();
+        let previous_max_retry_credentials = self.get_max_retry_credentials();
 
-        if let Err(err) = self.persist_load_balancing_mode(&mode) {
+        if let Some(mode) = &mode {
+            *self.load_balancing_mode.lock() = mode.clone();
+        }
+        if let Some(value) = request_retry {
+            self.request_retry.store(value, Ordering::Relaxed);
+        }
+        if let Some(value) = max_retry_credentials {
+            self.max_retry_credentials.store(value, Ordering::Relaxed);
+        }
+
+        if let Err(err) = self.persist_load_balancing_config(
+            mode.as_deref(),
+            request_retry,
+            max_retry_credentials,
+        ) {
             *self.load_balancing_mode.lock() = previous_mode;
+            self.request_retry
+                .store(previous_request_retry, Ordering::Relaxed);
+            self.max_retry_credentials
+                .store(previous_max_retry_credentials, Ordering::Relaxed);
             return Err(err);
         }
 
-        tracing::info!("负载均衡模式已设置为: {}", mode);
+        tracing::info!(
+            "负载均衡配置已更新: mode={}, requestRetry={}, maxRetryCredentials={}",
+            self.get_load_balancing_mode(),
+            self.get_request_retry(),
+            self.get_max_retry_credentials()
+        );
         Ok(())
     }
 
@@ -3214,7 +3432,11 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn persist_account_throttle_config(&self, failover: bool, cooldown_secs: u64) -> anyhow::Result<()> {
+    fn persist_account_throttle_config(
+        &self,
+        failover: bool,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
 
         let config_path = match self.config.config_path() {
@@ -3387,13 +3609,11 @@ mod tests {
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("kiroApiKey 重复")
-        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("kiroApiKey 重复"));
     }
 
     #[tokio::test]
@@ -3407,13 +3627,11 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("kiroApiKey 为空")
-        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("kiroApiKey 为空"));
     }
 
     #[tokio::test]
@@ -3427,13 +3645,11 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("缺少 kiroApiKey")
-        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("缺少 kiroApiKey"));
     }
 
     #[tokio::test]
@@ -3618,6 +3834,184 @@ mod tests {
         std::fs::remove_file(&config_path).unwrap();
     }
 
+    #[test]
+    fn test_set_load_balancing_config_persists_retry_fields() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-retry-config-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &config_path,
+            r#"{"loadBalancingMode":"priority","requestRetry":0,"maxRetryCredentials":0}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager
+            .set_load_balancing_config(Some("round-robin".to_string()), Some(2), Some(5))
+            .unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "round-robin");
+        assert_eq!(persisted.request_retry, 2);
+        assert_eq!(persisted.max_retry_credentials, 5);
+        assert_eq!(manager.get_load_balancing_mode(), "round-robin");
+        assert_eq!(manager.get_request_retry(), 2);
+        assert_eq!(manager.get_max_retry_credentials(), 5);
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_round_robin_cycles_same_priority_credentials() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+
+        let mut cred1 = KiroCredentials {
+            id: Some(10),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        cred1.access_token = Some("t1".to_string());
+        let mut cred2 = KiroCredentials {
+            id: Some(20),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        cred2.access_token = Some("t2".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, true).unwrap();
+
+        assert_eq!(manager.select_next_credential(None, None).unwrap().0, 10);
+        assert_eq!(manager.select_next_credential(None, None).unwrap().0, 20);
+        assert_eq!(manager.select_next_credential(None, None).unwrap().0, 10);
+    }
+
+    #[test]
+    fn test_round_robin_excluding_high_priority_reaches_lower_priority() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+
+        let high_a = KiroCredentials {
+            id: Some(1),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let high_b = KiroCredentials {
+            id: Some(2),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let low_c = KiroCredentials {
+            id: Some(3),
+            priority: 10,
+            ..KiroCredentials::default()
+        };
+
+        let manager =
+            MultiTokenManager::new(config, vec![high_a, high_b, low_c], None, None, true).unwrap();
+
+        let excluded = HashSet::from([1, 2]);
+        assert_eq!(
+            manager
+                .select_next_credential_excluding(None, None, &excluded)
+                .unwrap()
+                .0,
+            3
+        );
+    }
+
+    #[test]
+    fn test_round_robin_respects_group_filtering() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+
+        let alpha = KiroCredentials {
+            id: Some(1),
+            groups: vec!["alpha".to_string()],
+            ..KiroCredentials::default()
+        };
+        let beta = KiroCredentials {
+            id: Some(2),
+            groups: vec!["beta".to_string()],
+            ..KiroCredentials::default()
+        };
+
+        let manager = MultiTokenManager::new(config, vec![alpha, beta], None, None, true).unwrap();
+
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("alpha"))
+                .unwrap()
+                .0,
+            1
+        );
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("beta"))
+                .unwrap()
+                .0,
+            2
+        );
+        assert!(manager
+            .select_next_credential(None, Some("missing"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_excluded_acquire_does_not_change_current_id() {
+        let mut cred1 = KiroCredentials {
+            id: Some(1),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut cred2 = KiroCredentials {
+            id: Some(2),
+            priority: 10,
+            ..KiroCredentials::default()
+        };
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred1, cred2], None, None, true)
+                .unwrap();
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        let excluded = HashSet::from([1]);
+        let ctx = manager
+            .acquire_context_excluding(None, None, &excluded)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(manager.snapshot().current_id, 1);
+    }
+
+    #[test]
+    fn test_load_balancing_retry_limits_are_validated() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager
+            .set_load_balancing_config(None, Some(MAX_REQUEST_RETRY + 1), None)
+            .is_err());
+        assert!(manager
+            .set_load_balancing_config(None, None, Some(MAX_RETRY_CREDENTIALS + 1))
+            .is_err());
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
@@ -3648,8 +4042,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
-     {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled(
+    ) {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -4121,7 +4515,8 @@ mod tests {
     async fn test_concurrent_add_same_api_key_inserts_once() {
         let path = tmp_creds_path("concurrent_dedup");
         let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true).unwrap(),
+            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true)
+                .unwrap(),
         );
 
         const N: usize = 8;
@@ -4142,7 +4537,10 @@ mod tests {
                 ok_count += 1;
             }
         }
-        assert_eq!(ok_count, 1, "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次");
+        assert_eq!(
+            ok_count, 1,
+            "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次"
+        );
 
         let snapshot = manager.snapshot();
         assert_eq!(
@@ -4294,7 +4692,10 @@ mod tests {
         assert!(group_matches(&[], None));
         assert!(group_matches(&["g1".to_string()], None));
         // 绑定分组时只匹配 groups 含该名的账号
-        assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
+        assert!(group_matches(
+            &["g1".to_string(), "g2".to_string()],
+            Some("g1")
+        ));
         assert!(!group_matches(&["g2".to_string()], Some("g1")));
         assert!(!group_matches(&[], Some("g1")));
     }
@@ -4336,9 +4737,14 @@ mod tests {
         pro_cred.subscription_title = Some("KIRO PRO".to_string());
         pro_cred.priority = 10;
 
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free_cred, pro_cred], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![free_cred, pro_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         // Warm current_id with the highest-priority Free account.
         let current = manager.acquire_context(None, None).await.unwrap();
@@ -4397,7 +4803,11 @@ mod tests {
         manager.report_success(1);
         manager.report_success(1);
         let pick = manager.select_next_credential(None, Some("g1"));
-        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
+        assert_eq!(
+            pick.map(|(id, _)| id),
+            Some(2),
+            "balanced 应在 g1 内选 success_count 最小的 B"
+        );
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));

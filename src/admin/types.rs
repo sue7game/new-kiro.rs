@@ -399,16 +399,27 @@ pub struct EnableOverageAllResult {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
+    /// 当前模式（"priority"、"balanced" 或 "round-robin"）
     pub mode: String,
+    /// 请求失败后的额外重试轮数。
+    pub request_retry: u32,
+    /// 每轮最多尝试的不同凭据数量；0 表示尝试所有可用凭据。
+    pub max_retry_credentials: usize,
 }
 
 /// 设置负载均衡模式请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
-    pub mode: String,
+    /// 模式（"priority"、"balanced" 或 "round-robin"）；缺省表示不修改。
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// 请求失败后的额外重试轮数；缺省表示不修改。
+    #[serde(default)]
+    pub request_retry: Option<u32>,
+    /// 每轮最多尝试的不同凭据数量；缺省表示不修改。
+    #[serde(default)]
+    pub max_retry_credentials: Option<usize>,
 }
 
 /// 账号级风控故障转移配置响应
@@ -735,6 +746,9 @@ pub struct ClientKeyItem {
     pub total_cache_read_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 每分钟请求数上限。None 表示不限速。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
     #[serde(default)]
     pub is_system: bool,
@@ -757,6 +771,9 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 每分钟请求数上限；缺省或 0 表示不限速。
+    #[serde(default)]
+    pub rpm_limit: Option<u32>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -777,6 +794,9 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 每分钟请求数上限；不传不修改，0 表示清空限制。
+    #[serde(default)]
+    pub rpm_limit: Option<u32>,
 }
 
 // ============ IdC 设备授权登录 ============

@@ -40,6 +40,25 @@ function formatRelative(ts?: string): string {
   return `${Math.floor(diff / 86400_000)} 天前`
 }
 
+function formatRpmLimit(limit?: number): string {
+  return limit && limit > 0 ? `${limit} RPM` : '不限速'
+}
+
+function parseRpmLimit(value: string): number | undefined {
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  const parsed = Number(trimmed)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return Math.floor(parsed)
+}
+
+function hasInvalidRpmLimit(value: string): boolean {
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  const parsed = Number(trimmed)
+  return !Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)
+}
+
 export function ClientKeysPage() {
   const { data, isLoading } = useClientKeys()
   // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
@@ -56,6 +75,7 @@ export function ClientKeysPage() {
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
+  const [createRpmLimit, setCreateRpmLimit] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -64,6 +84,7 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
+  const [editRpmLimit, setEditRpmLimit] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -72,17 +93,23 @@ export function ClientKeysPage() {
       toast.error('请填写名称')
       return
     }
+    if (hasInvalidRpmLimit(createRpmLimit)) {
+      toast.error('RPM 上限必须是 0 或正整数')
+      return
+    }
     try {
       const res = await createKey.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
+        rpmLimit: parseRpmLimit(createRpmLimit),
       })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
+      setCreateRpmLimit('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -164,16 +191,26 @@ export function ClientKeysPage() {
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
+    setEditRpmLimit(item.rpmLimit ? String(item.rpmLimit) : '')
     setEditOpen(true)
   }
 
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!editTarget) return
+    if (hasInvalidRpmLimit(editRpmLimit)) {
+      toast.error('RPM 上限必须是 0 或正整数')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
+        req: {
+          name: editName.trim(),
+          description: editDesc.trim(),
+          group: editGroup.trim(),
+          rpmLimit: parseRpmLimit(editRpmLimit) ?? 0,
+        },
       })
       toast.success('已更新')
       setEditOpen(false)
@@ -223,7 +260,7 @@ export function ClientKeysPage() {
       ) : (
         <Card>
           <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[920px] text-sm">
+            <table className="w-full min-w-[1040px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">ID</th>
@@ -231,6 +268,7 @@ export function ClientKeysPage() {
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">分组</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
+                  <th className="text-right font-medium px-4 py-3">RPM 上限</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
@@ -291,6 +329,9 @@ export function ClientKeysPage() {
                       ) : (
                         <Badge variant="success">启用</Badge>
                       )}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      {formatRpmLimit(k.rpmLimit)}
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalInputTokens)}</td>
@@ -390,6 +431,21 @@ export function ClientKeysPage() {
                 绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
               </p>
             </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">RPM 上限（可选）</label>
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                placeholder="留空或 0 表示不限速"
+                value={createRpmLimit}
+                onChange={(e) => setCreateRpmLimit(e.target.value)}
+                disabled={createKey.isPending}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                限制该 Key 每 60 秒可通过的请求数，覆盖 /v1 和 /cc/v1 的所有受鉴权接口。
+              </p>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -460,7 +516,7 @@ export function ClientKeysPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
+            <DialogDescription>修改名称、描述、分组与 RPM 上限（不影响 Key 值与统计）</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleEditSave} className="space-y-3 py-2">
             <div>
@@ -482,6 +538,21 @@ export function ClientKeysPage() {
               />
               <p className="mt-1 text-[11px] text-muted-foreground">
                 绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
+              </p>
+            </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">RPM 上限</label>
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                placeholder="留空或 0 表示不限速"
+                value={editRpmLimit}
+                onChange={(e) => setEditRpmLimit(e.target.value)}
+                disabled={updateKey.isPending}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                保存为空或 0 会清空该 Key 的 RPM 限制。
               </p>
             </div>
             <DialogFooter>

@@ -21,9 +21,21 @@ import {
   useAccountThrottleConfig, useSetAccountThrottleConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { updateAdminKey } from '@/api/credentials'
+import { updateAdminKey, type LoadBalancingMode } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
+
+const loadBalancingLabels: Record<LoadBalancingMode, string> = {
+  priority: '优先级',
+  balanced: '均衡负载',
+  'round-robin': '轮询',
+}
+
+function nextLoadBalancingMode(mode?: LoadBalancingMode): LoadBalancingMode {
+  if (mode === 'priority') return 'balanced'
+  if (mode === 'balanced') return 'round-robin'
+  return 'priority'
+}
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -58,9 +70,9 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || 'priority'
-    const next = cur === 'priority' ? 'balanced' : 'priority'
+    const next = nextLoadBalancingMode(cur)
     setLoadBalancingMode(next, {
-      onSuccess: () => toast.success(`已切换到${next === 'priority' ? '优先级模式' : '均衡负载模式'}`),
+      onSuccess: () => toast.success(`已切换到${loadBalancingLabels[next]}模式`),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -229,7 +241,7 @@ interface ToolControls {
   isLoadingThrottle: boolean
   isSettingMode: boolean
   isSettingThrottle: boolean
-  loadBalancingMode?: 'priority' | 'balanced'
+  loadBalancingMode?: LoadBalancingMode
   openImageUpdate: () => void
   openKeyDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
@@ -280,9 +292,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
           <Activity />
           {controls.isLoadingMode
             ? '负载均衡加载中'
-            : controls.loadBalancingMode === 'priority'
-              ? '切换到均衡负载'
-              : '切换到优先级'}
+            : `切换到${loadBalancingLabels[nextLoadBalancingMode(controls.loadBalancingMode)]}`}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.handleRefresh}>
           <RefreshCw />刷新数据
@@ -313,9 +323,7 @@ function LoadBalancingButton({ controls }: { controls: ToolControls }) {
       <span className="hidden md:inline">
         {controls.isLoadingMode
           ? '加载中…'
-          : controls.loadBalancingMode === 'priority'
-            ? '优先级'
-            : '均衡负载'}
+          : loadBalancingLabels[controls.loadBalancingMode || 'priority']}
       </span>
     </Button>
   )

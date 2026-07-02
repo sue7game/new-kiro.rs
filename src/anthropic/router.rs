@@ -8,6 +8,7 @@ use axum::{
 };
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::rate_limit::SharedRateLimiter;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::admin::trace_db::SharedTraceStore;
 use crate::kiro::provider::KiroProvider;
@@ -37,6 +38,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -50,6 +52,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    rate_limiter: Option<SharedRateLimiter>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -58,6 +61,7 @@ pub fn create_router(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_rate_limiter(rate_limiter);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
