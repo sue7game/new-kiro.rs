@@ -12,6 +12,7 @@ use crate::admin::rate_limit::SharedRateLimiter;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::admin::trace_db::SharedTraceStore;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::ToolCompatibilityMode;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -29,10 +30,12 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Router {
     create_router(
         kiro_provider,
         extract_thinking,
+        tool_compatibility_mode,
         None,
         None,
         None,
@@ -47,6 +50,7 @@ pub fn create_router_with_provider(
 pub fn create_router(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    tool_compatibility_mode: ToolCompatibilityMode,
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
@@ -54,7 +58,7 @@ pub fn create_router(
     trace_store: Option<SharedTraceStore>,
     rate_limiter: Option<SharedRateLimiter>,
 ) -> Router {
-    let mut state = AppState::new(extract_thinking);
+    let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
