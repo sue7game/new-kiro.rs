@@ -4,6 +4,87 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-07-15
+
+主题：**打通 Codex CLI 完整工具链——桥接 function / custom / namespace 工具到 Anthropic 模型，并修复工具结果后空响应导致任务误标记完成的问题**。0.7.0 引入了 Responses 端点使 Codex CLI 能连接 kiro-rs，但此前仅支持纯聊天与 Web 搜索——Codex 的真实工具（shell / apply_patch / view_image / MCP 等）被全部剥离，导致 Codex 无法读写文件、执行命令或编辑代码。本版补全工具桥接的全链路：从 Codex 的工具声明收集、到 Anthropic 模型侧的 schema 翻译、再到响应侧按声明类型正确生成 `function_call` 或 `custom_tool_call`——实现 Codex CLI 与 kiro-rs 的完整能力对齐。
+
+> 来源：[PR #39](https://github.com/ZyphrZero/kiro.rs/pull/39)。提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
+
+### ✨ 新功能 — Codex CLI 完整工具桥接
+
+- **请求方向收集工具声明**：同时从 `req.tools`（顶层）和 `additional_tools` input item（Codex 0.144 把工具声明放在此处）收集工具定义，合并转换后转发给上游模型，不再忽略 Codex 的真实工具。
+- **区分 `function` 与 `custom` 工具类型**：Codex 要求应答 item 类型与声明严格一致（否则抛出 "tool invoked with incompatible payload" 并终止本轮）。`function` 类型（shell / MCP / view_image 等）→ 应答 `function_call`（JSON arguments）；`custom` 类型（apply_patch / code-mode exec 等自由文本工具）→ 应答 `custom_tool_call`（原始字符串 input）。每请求维护一张 `ToolKindMap`，请求翻译时生成、响应构造时消费，保证出方向 item 类型永远正确。
+- **自由文本工具包装与解包**：Anthropic 侧没有自由文本工具概念，进方向将 custom 工具包装为 `{"input": <string>}` 单字段 schema（grammar / format 附到 description 提示模型输入格式），出方向通过多级回退链解出原始 input 字符串（模型偶尔不守 schema 时也能兜住）。
+- **Namespace 分组支持**：Codex 0.144 的 collaboration 子代理等工具挂在 `namespace` 分组下——对 Anthropic 模型展平为 `ns__name`（`__` 连接，避免与工具名中的 `.` 冲突），应答时还原为原 `name` + `namespace` 字段。
+- **混合工具集的 Agentic Loop**：有 Codex 工具时仍注入原生 `web_search_20250305`（除非客户端已声明同名工具），请求进入 web_search agentic loop——loop 内部消化 web_search、把其它 client 工具的 `tool_use` 原样透传，实现搜索与代码工具无缝共存。
+- **软化 System Prompt**：有 Codex 工具时使用软化 nudge（"Use your other tools normally for all other work"），替代无工具时的严格 nudge（"Do not call any other tool"），让模型自由选择搜索或执行代码工具。
+- **Developer 角色 → System 映射**：Codex 的 `role:developer` message item（AGENTS.md / user_instructions / environment_context）转为 Anthropic system 消息，确保技能文件和环境上下文到达模型。
+
+### ✨ 新功能 — 推理摘要与搜索展示（Phase 2）
+
+- **推理摘要 `reasoning` item**：从上游 reasoning 事件收集思考文本，通过顶层 `kiro_thinking` 字段（非 content block）出带传递——Anthropic 客户端忽略未知顶层字段，不会回放未签名的 thinking block；Responses 译者则将其渲染为 `reasoning` summary item，供 Codex UI 展示"模型正在思考"。
+- **`web_search_call` 展示项**：内部代答的 web_search 以 `server_tool_use` 块收集，在 Responses 响应中渲染为 `web_search_call` item（含 query 与 status），Codex 界面可展示 "Searched the web"。
+- **SSE 事件序列补齐**：新增 `reasoning`、`custom_tool_call`、`web_search_call` 三类 output item 的完整 SSE 事件序列（added → delta/part → done），每个 item 保证 `output_item.done` 携带完整内容（Codex 仅从 done 构建回合）。
+
+### 🔧 修复 — 工具结果后空助手响应
+
+- **问题**：上游 Kiro 偶尔在收到 `tool_result` 后返回一个只有思考文本（无可见 assistant text、无 client 工具调用）的回合——旧代码将其序列化为 `end_turn`，导致 Codex 将该回合视为任务完成、在工具尚未执行完时错误标记任务结束。
+- **修复**：新增 `empty_tool_result_disposition` 判别——仅当最后一轮 user 消息含 `tool_result`、且助手回合无可见文本、无工具调用、无终止原因时，判定为"空洞继续"。此时重试一次；重试仍空洞则返回 `502 Bad Gateway`（而非静默标记完成）。纯思考文本本身不足以构成有效继续——Codex 需要真实 assistant 文本或 client tool call 才能保持任务生命周期正确。
+- **kiro_thinking 不重复**：只有被接受的（非空洞）回合的思考文本才累积到 `all_thinking`；被丢弃的空洞回合的思考不被回放，避免与成功回合的总结重复或矛盾。
+
+### 📝 文档
+
+- **README 更新**：反映项目已支持 OpenAI Chat Completions / Responses 端点与 Codex CLI；补充 GPT-5.6 模型族说明、流式格式说明、部署示例更新到 0.7.0。
+
+### 🧪 测试
+
+- **20 个纯单元测试**（无网络依赖）覆盖：工具声明收集（additional_tools / 顶层 / 混合）、namespace 展平与还原、custom 工具包装 schema、function 工具 schema 原样映射、noop 回退、nudge 软化、web_search 名字冲突处理、custom_tool_call 回放往返、function_call_output 数组 stringify、developer→system 映射、reasoning/web_search_call/compaction 跳过、custom_input 多级回退链、build_view 输出类型与顺序、SSE 事件完整性。
+- **4 个空响应判别测试**：工具结果后空洞重试一次→失败、有文本/工具调用则不重试、仅思考文本无可见输出仍触发重试、仅最后一条消息决定是否为工具继续场景。
+- E2E 验证（gpt-5.6-sol + claude-sonnet-4-6）：shell 读文件、apply_patch 写文件、多轮循环、实时 web_search、只读 /plan 项目研究、技能发现——均无 incompatible payload 错误。
+
+## [0.7.0] - 2026-07-15
+
+主题：**新增 GPT-5.6 模型与 OpenAI Chat Completions / Responses 兼容端点，并统一入口 API Key 的生成与自定义配置语义**。OpenAI 协议客户端（包括仅支持 Responses API 的新版 Codex CLI）现在可以直接复用 Kiro 的模型映射、凭据故障转移、用量计量、工具调用与 WebSearch 链路；同时，程序生成的入口 Key 统一使用 `sk-` 前缀，鉴权不再限制前缀，`config.json` 中的 `apiKey` 可使用任意自定义值并作为系统密钥的权威配置。
+
+### ✨ 新功能 — GPT-5.6 与 OpenAI 协议兼容
+
+> 来源：[PR #38](https://github.com/ZyphrZero/kiro.rs/pull/38)。提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
+
+- **新增 GPT-5.6 模型族**：支持 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`，模型 ID 原样传递给 Kiro；上下文窗口按 272K 处理，并通过 `GET /v1/models` 对外公布。
+- **新增 Chat Completions 端点**：`POST /v1/chat/completions` 支持 OpenAI 消息、工具调用、`reasoning_effort`、非流式响应与 SSE 响应，内部复用既有 Anthropic 请求管道。
+- **新增 Responses 端点**：`POST /v1/responses` 支持新版 Codex CLI 使用的 Responses API，转换 instructions / input / reasoning / function call，并生成对应的非流式响应或 SSE 事件序列。
+- **复用现有运行时能力**：两个 OpenAI 端点沿用同一套 API Key 鉴权、模型映射、多凭据故障转移、用量统计及 Kiro MCP WebSearch；`/cc/v1` Claude Code 路径保持不变。
+
+### 🔧 修复 — API Key 生成、自定义与轮换语义
+
+- **生成格式统一为 `sk-`**：服务端创建和轮换的客户端 Key 均为 `sk-` 加 32 位 base62 随机字符串；默认配置的生成值与示例配置值同样以 `sk-` 开头。
+- **鉴权只做完整值匹配**：删除 `csk_` 前缀常量与前缀校验，不增加旧前缀兼容分支；请求携带的 Key 只与未禁用的已存储明文做常量时间精确比较。
+- **允许任意自定义配置值**：`config.json.apiKey` 不要求 `sk-` 前缀。每次启动都将其同步为唯一的系统密钥 `id=0`；修改配置后旧系统密钥立即失效，现有名称、描述、分组与统计保持不变。
+- **Unicode 自定义 Key 安全脱敏**：管理端按 Unicode 字符而非 UTF-8 字节切片，非 ASCII 自定义 Key 不再因切到字符中间而触发运行时 panic。
+- **清理过时说明**：README、示例配置、Rust 注释与 Admin UI 统一为“系统密钥不可删除、可轮换”，移除当前文档中的 `csk_*` 生成规则描述。
+
+## [0.6.11] - 2026-07-12
+
+主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。
+
+### 🔧 修复 — AWS Enterprise / IdC 余额与模型列表查询
+
+- **旧版 REST GET 不再携带 `profileArn`**：`getUsageLimits` 与 `ListAvailableModels` 继续使用 Kiro 0.9.2 兼容 User-Agent，但 URL 不再拼接首次模型调用解析出的真实 `profileArn`，避免上游将请求判定为格式错误。
+- **保留企业流式调用所需 ARN**：不删除、不回滚凭据中已经解析并持久化的 `profileArn`；`generateAssistantResponse` / `SendMessageStreaming` 等流式模型请求仍正常注入真实 ARN，Enterprise 的 `tokentype: EXTERNAL_IDP`、IdC Token 刷新与区域回退逻辑保持不变。
+- **覆盖状态迁移回归场景**：新增 URL 构造测试，模拟企业凭据从“刚导入、无真实 ARN”进入“首次模型调用后、已有真实 ARN”的状态，确保余额与模型列表请求始终省略 `profileArn`。
+
+### 🔧 修复 — 上游 429 全链路传播与 WebSearch 一致性
+
+> 合并并扩展 [PR #35](https://github.com/ZyphrZero/kiro.rs/pull/35)：保留类型化上游限流及 `Retry-After`，并补齐 Admin、MCP / WebSearch、Token 刷新和分组隔离链路。
+
+- **429 与 `Retry-After` 不再丢失**：模型、MCP、余额、模型列表、超额开关、凭据添加与强制刷新等链路统一返回 HTTP 429；只转发合法的秒数或 HTTP-date，存在明确等待时间时不再在服务端提前重试。
+- **WebSearch 正确传播失败**：纯 WebSearch 不再把 MCP 429 吞成空搜索结果和 HTTP 200；`stream: false` 返回普通 JSON，`stream: true` 保持 SSE。
+- **客户端 Key 分组隔离**：纯 WebSearch 与混合 WebSearch 的 MCP 调用沿用客户端 Key 对应的凭据组，不会越组选择或统计凭据。
+- **并发冷却保留原始 429**：请求已收到类型化 429 后，即使并发冷却使下一次凭据选择失败，也优先返回原始限流，而不是退化为通用 502。
+- **刷新限流不再误伤凭据**：Social、AWS IdC 与 External IdP 刷新端点的 429 不计入 Token 刷新失败次数；自动刷新与 401/403 触发的强制刷新均会立即保留类型化 429，不会重复撞刷新端点或因临时限流永久禁用有效凭据。
+- **Enterprise profile 发现保留限流**：`ListAvailableProfiles` 返回 429 时停止后续模型请求并原样传播合法 `Retry-After`，不再吞掉限流后继续使用缺失或占位 `profileArn`。
+- **隐藏上游敏感错误正文**：通用 502 对客户端使用稳定错误消息，AWS 账号、请求标识等原始响应仅保留在服务端日志中。
+
 ## [0.6.10] - 2026-07-10
 
 主题：**放宽 Admin API 请求体上限，修复批量导入凭据时大 JSON 被拒的 413 问题**。批量导入会一次性提交待导入凭据，包含 `refreshToken`、`clientSecret` 等较长字段；当条目较多时，请求体容易超过 axum 默认 2MB 限制并返回 HTTP 413。本版将 Admin 路由请求体上限统一放宽到 50MB，与 Anthropic 路由保持一致，确保大批量导入请求能进入服务端有界并发处理流程。
@@ -761,4 +842,3 @@ project adheres to [Semantic Versioning](https://semver.org/).
    - 如需开启每日自动更新，添加 `"updateAutoApply": true` 与 `"updateAutoApplyTime": "03:00"`。
 4. **首次发布**
    - 维护者需在仓库 Settings → Secrets 添加 `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN`，否则 CI 推送会失败。
-

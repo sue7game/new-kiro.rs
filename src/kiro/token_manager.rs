@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{build_client, ProxyConfig};
+use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
@@ -187,8 +188,14 @@ async fn refresh_social_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -284,8 +291,14 @@ async fn refresh_idc_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
         if status.as_u16() == 400
@@ -380,8 +393,14 @@ async fn refresh_external_idp_token(
         .await?;
 
     let status = response.status();
+    let rate_limit_error = (status.as_u16() == 429)
+        .then(|| UpstreamRateLimitError::from_headers(response.headers()));
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
+
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // invalid_grant → refreshToken 永久失效（Azure 返回
         // {"error":"invalid_grant","error_description":"..."}）
@@ -445,6 +464,19 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
+fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
+    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
+    // only for the streaming endpoint and makes this legacy request malformed.
+    format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        host
+    )
+}
+
+fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
+    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -465,12 +497,6 @@ pub(crate) async fn get_usage_limits(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    let profile_arn_query = credentials
-        .effective_profile_arn()
-        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
-        .unwrap_or_default();
-
     // 构建 User-Agent headers
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -483,10 +509,7 @@ pub(crate) async fn get_usage_limits(
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = format!(
-            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
-            host, profile_arn_query
-        );
+        let url = usage_limits_url(&host, credentials);
 
         let mut request = client
             .get(&url)
@@ -505,12 +528,17 @@ pub(crate) async fn get_usage_limits(
         let response = request.send().await?;
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             let data: UsageLimitsResponse = response.json().await?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -562,12 +590,6 @@ pub(crate) async fn get_available_models(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    let profile_arn_query = credentials
-        .effective_profile_arn()
-        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
-        .unwrap_or_default();
-
     // 构建 User-Agent headers（与 get_usage_limits 保持一致）
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -580,10 +602,7 @@ pub(crate) async fn get_available_models(
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = format!(
-            "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
-            host, profile_arn_query
-        );
+        let url = available_models_url(&host, credentials);
 
         let mut request = client
             .get(&url)
@@ -602,12 +621,17 @@ pub(crate) async fn get_available_models(
         let response = request.send().await?;
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             let data: ListAvailableModelsResponse = response.json().await?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -700,6 +724,8 @@ pub(crate) async fn list_available_profiles(
 
         let response = request.send().await?;
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
 
         if status.is_success() {
             let data: ListAvailableProfilesResponse = response.json().await?;
@@ -712,6 +738,9 @@ pub(crate) async fn list_available_profiles(
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
         last_error = Some(format!("{} {}", status, body_text));
         // 403 等错误继续尝试下一个候选端点
     }
@@ -794,11 +823,16 @@ pub(crate) async fn set_user_preference(
         let response = request.send().await?;
 
         let status = response.status();
+        let rate_limit_error = (status.as_u16() == 429)
+            .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
             return Ok(());
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if let Some(error) = rate_limit_error {
+            return Err(error.into());
+        }
 
         // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
         if status.as_u16() == 403 && idx + 1 < candidates.len() {
@@ -1222,12 +1256,7 @@ impl MultiTokenManager {
         *self.proxy.lock() = proxy;
     }
 
-    /// 获取凭据总数
-    pub fn total_count(&self) -> usize {
-        self.entries.lock().len()
-    }
-
-    /// 获取指定分组的凭据总数（group=None 时等于 total_count）
+    /// 获取指定分组的凭据总数（group=None 时返回全部凭据数）
     ///
     /// 用于按分组计算 failover 重试预算，避免小分组按全局账号数获得过多无效重试。
     pub fn total_count_in_group(&self, group: Option<&str>) -> usize {
@@ -1504,17 +1533,9 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）
-                        if self.try_reload_credential_from_file(id) {
-                            // 找到新 Token，不计入失败次数，直接重试
-                            continue;
-                        }
-                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                        self.report_refresh_token_invalid(id)
-                    } else {
-                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                        self.report_refresh_failure(id)
+                    let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
+                        // 从源文件加载到了轮换后的 Token，不计失败次数，直接重试。
+                        continue;
                     };
                     attempt_count += 1;
                     if !has_available {
@@ -1522,6 +1543,34 @@ impl MultiTokenManager {
                     }
                 }
             }
+        }
+    }
+
+    /// 分类并记录一次 Token 刷新错误。
+    ///
+    /// 上游 429 是临时流控，不代表凭据失效，因此直接保留类型化错误返回，绝不增加
+    /// `refresh_failure_count`。`Ok(None)` 表示已从源文件加载到轮换后的 Token，调用方
+    /// 应使用同一凭据立即重试；`Ok(Some(_))` 返回记录失败后是否仍有可用凭据。
+    fn handle_token_refresh_error(
+        &self,
+        id: u64,
+        error: anyhow::Error,
+    ) -> anyhow::Result<Option<bool>> {
+        if error.downcast_ref::<UpstreamRateLimitError>().is_some() {
+            tracing::warn!("凭据 #{} Token 刷新被上游限流", id);
+            return Err(error);
+        }
+
+        if error.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            // 先尝试从源文件重新加载（适用于 IDE 退出后 token rotation 导致失效的场景）。
+            if self.try_reload_credential_from_file(id) {
+                return Ok(None);
+            }
+            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, error);
+            Ok(Some(self.report_refresh_token_invalid(id)))
+        } else {
+            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, error);
+            Ok(Some(self.report_refresh_failure(id)))
         }
     }
 
@@ -2344,8 +2393,14 @@ impl MultiTokenManager {
     /// 与 `report_failure` 不同：不计入永久禁用，到期自动恢复，可用于"`suspicious activity` 429"
     /// 这种短期账号级风控——当前凭据先冷却 N 分钟，故障转移到其它凭据。
     ///
-    /// 返回剩余可用凭据数（已排除冷却中的）。
-    pub fn report_account_throttled(&self, id: u64, cooldown: StdDuration) -> usize {
+    /// 标记凭据冷却，并在同一锁临界区内返回当前请求范围的剩余凭据数。
+    pub fn report_account_throttled_for_request(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
         let now = Instant::now();
         {
             let mut entries = self.entries.lock();
@@ -2374,6 +2429,7 @@ impl MultiTokenManager {
                             .throttled_until
                             .map(|t| t > throttled_now)
                             .unwrap_or(false)
+                        && credential_matches_request(&e.credentials, model, group)
                 })
                 .count()
         }
@@ -3705,7 +3761,7 @@ mod tests {
         assert!(result.is_ok());
         let id = result.unwrap();
         assert!(id > 0);
-        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
     }
 
@@ -3783,7 +3839,7 @@ mod tests {
 
         let result = manager.add_credential(api_key_cred).await;
         assert!(result.is_ok());
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 2);
     }
 
@@ -3799,7 +3855,7 @@ mod tests {
 
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 2);
     }
 
@@ -3810,7 +3866,7 @@ mod tests {
         // 支持 0 个凭据启动（可通过管理面板添加）
         assert!(result.is_ok());
         let manager = result.unwrap();
-        assert_eq!(manager.total_count(), 0);
+        assert_eq!(manager.snapshot().total, 0);
         assert_eq!(manager.available_count(), 0);
     }
 
@@ -3846,7 +3902,7 @@ mod tests {
 
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 2);
+        assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
     }
 
@@ -3860,7 +3916,7 @@ mod tests {
         cred.kiro_api_key = Some("ksk_test123".to_string());
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
     }
 
@@ -3908,6 +3964,30 @@ mod tests {
         manager.report_failure(1);
         manager.report_failure(1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn refresh_rate_limit_does_not_disable_or_increment_failure_count() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
+        let returned = manager
+            .handle_token_refresh_error(1, error)
+            .expect_err("429 应立即返回给调用方");
+
+        assert!(returned.downcast_ref::<UpstreamRateLimitError>().is_some());
+        let snapshot = manager.snapshot();
+        let entry = &snapshot.entries[0];
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert!(!entry.disabled);
+        assert_eq!(entry.disabled_reason, None);
     }
 
     #[test]
@@ -4462,6 +4542,26 @@ mod tests {
     }
 
     #[test]
+    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+        let host = "q.us-east-1.amazonaws.com";
+
+        assert_eq!(
+            usage_limits_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+        );
+        assert_eq!(
+            available_models_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+        );
+    }
+
+    #[test]
     fn test_credential_region_empty_string_treated_as_set() {
         // 空字符串 auth_region 被视为已设置（虽然不推荐，但行为应一致）
         let mut config = Config::default();
@@ -4926,6 +5026,46 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn test_available_count_for_request_respects_group_throttle() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g1"))
+                .map(|(id, _)| id),
+            Some(1)
+        );
+        // g1 的唯一凭据进入冷却后，即使全局还有 g2，g1 也必须视为无可用账号。
+        assert_eq!(
+            manager.report_account_throttled_for_request(
+                1,
+                StdDuration::from_secs(60),
+                None,
+                Some("g1"),
+            ),
+            0
+        );
+        assert!(manager.select_next_credential(None, Some("g1")).is_none());
+        assert_eq!(
+            manager
+                .select_next_credential(None, Some("g2"))
+                .map(|(id, _)| id),
+            Some(2)
+        );
+        assert_eq!(manager.snapshot().available, 1);
     }
 
     #[test]

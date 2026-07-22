@@ -14,6 +14,7 @@ use tokio::time::sleep;
 use crate::admin::trace_db::{outcome, truncate_snippet, TraceAttempt, TraceSink};
 use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -185,23 +186,26 @@ impl KiroProvider {
     ///   之后该凭据的 `streaming_profile_arn()` 直接命中，不再进入此路径。
     /// - 无 Enterprise profile（纯 BuilderID 等）→ 保持占位符回退逻辑，并标记已尝试，
     ///   避免每次请求重复查询。
-    async fn ensure_profile_arn(&self, ctx: &mut crate::kiro::token_manager::CallContext) {
+    async fn ensure_profile_arn(
+        &self,
+        ctx: &mut crate::kiro::token_manager::CallContext,
+    ) -> anyhow::Result<()> {
         use crate::kiro::model::credentials::is_placeholder_profile_arn;
 
         if ctx.credentials.is_api_key_credential() {
-            return;
+            return Ok(());
         }
         let needs = match ctx.credentials.profile_arn.as_deref() {
             None => true,
             Some(arn) => is_placeholder_profile_arn(arn),
         };
         if !needs {
-            return;
+            return Ok(());
         }
         // 进程内去重：仅在「拿到上游确定结果」后才标记已尝试，避免一次网络抖动
         // 把账号永久卡在占位符上（重启前不再重试）。
         if self.profile_resolution_attempted.lock().contains(&ctx.id) {
-            return;
+            return Ok(());
         }
         match self
             .token_manager
@@ -218,6 +222,9 @@ impl KiroProvider {
                 self.profile_resolution_attempted.lock().insert(ctx.id);
             }
             Err(e) => {
+                if is_rate_limit_error(&e) {
+                    return Err(e);
+                }
                 // 网络/瞬态错误：不标记，下次请求再试；本次按原 profileArn 继续
                 tracing::warn!(
                     "凭据 #{} 解析真实 profileArn 失败（按原 profileArn 继续）: {}",
@@ -226,6 +233,7 @@ impl KiroProvider {
                 );
             }
         }
+        Ok(())
     }
 
     /// 发送非流式 API 请求
@@ -254,19 +262,27 @@ impl KiroProvider {
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body).await
+    pub async fn call_mcp(
+        &self,
+        request_body: &str,
+        group: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_mcp_with_retry(request_body, group).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let total_credentials = self.token_manager.total_count().max(1);
+    async fn call_mcp_with_retry(
+        &self,
+        request_body: &str,
+        group: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let legacy_max_retries =
             (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let retry_rounds = self.token_manager.get_request_retry() as usize + 1;
         let per_round_limit = self
             .token_manager
-            .credential_limit_per_retry_round(None, None)
+            .credential_limit_per_retry_round(None, group)
             .max(1);
         let max_retries = legacy_max_retries.max(retry_rounds.saturating_mul(per_round_limit));
         let mut last_error: Option<anyhow::Error> = None;
@@ -281,7 +297,7 @@ impl KiroProvider {
                 && (tried_in_round.len() >= per_round_limit
                     || self.token_manager.available_count_for_request_excluding(
                         None,
-                        None,
+                        group,
                         &tried_in_round,
                     ) == 0)
             {
@@ -293,14 +309,20 @@ impl KiroProvider {
                 sleep(Self::retry_delay_throttle(round.saturating_sub(1))).await;
             }
 
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
+            // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
             let ctx = match self
                 .token_manager
-                .acquire_context_excluding(None, None, &tried_in_round)
+                .acquire_context_excluding(None, group, &tried_in_round)
                 .await
             {
                 Ok(c) => c,
                 Err(e) => {
+                    if is_rate_limit_error(&e) {
+                        return Err(e);
+                    }
+                    if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
+                        return Err(rate_limit);
+                    }
                     last_error = Some(e);
                     attempt += 1;
                     continue;
@@ -363,6 +385,8 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let rate_limit_error = (status.as_u16() == 429)
+                .then(|| UpstreamRateLimitError::from_headers(response.headers()));
 
             // 成功响应
             if status.is_success() {
@@ -394,12 +418,9 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx.id)
-                        .await
-                        .is_ok()
-                    {
+                    if Self::handle_force_refresh_result(
+                        self.token_manager.force_refresh_token_for(ctx.id).await,
+                    )? {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -432,21 +453,16 @@ impl KiroProvider {
                     );
                     let remaining = self
                         .token_manager
-                        .report_account_throttled(ctx.id, cooldown);
-                    last_error = Some(anyhow::anyhow!(
-                        "MCP 请求失败（账号级风控，凭据 #{} 已冷却 {} 分钟）: {} {}",
-                        ctx.id,
-                        cooldown_secs / 60,
-                        status,
-                        body
-                    ));
-                    if remaining == 0 {
-                        anyhow::bail!(
-                            "MCP 请求失败：所有凭据都处于账号风控冷却或已禁用状态。原始响应: {} {}",
-                            status,
-                            body
-                        );
+                        .report_account_throttled_for_request(ctx.id, cooldown, None, group);
+                    let (rate_limit, must_wait_for_upstream) =
+                        account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
+                    if must_wait_for_upstream {
+                        return Err(rate_limit.into());
                     }
+                    if remaining == 0 {
+                        return Err(rate_limit.into());
+                    }
+                    last_error = Some(rate_limit.into());
                 } else {
                     tracing::warn!(
                         "MCP 请求失败（账号级风控，故障转移关闭，按瞬态限流重试，尝试 {}/{}）: {}",
@@ -454,7 +470,11 @@ impl KiroProvider {
                         max_retries,
                         body
                     );
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    let rate_limit = rate_limit_error.expect("429 必须包含限流错误上下文");
+                    if !rate_limit.should_retry_locally() {
+                        return Err(rate_limit.into());
+                    }
+                    last_error = Some(rate_limit.into());
                     transient_failures += 1;
                     if transient_failures >= legacy_max_retries {
                         break;
@@ -476,7 +496,11 @@ impl KiroProvider {
                     body
                 );
                 tried_in_round.insert(ctx.id);
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                let rate_limit = rate_limit_error.expect("429 必须包含限流错误上下文");
+                if !rate_limit.should_retry_locally() {
+                    return Err(rate_limit.into());
+                }
+                last_error = Some(rate_limit.into());
                 continue;
             }
 
@@ -489,7 +513,14 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = if let Some(rate_limit) = rate_limit_error {
+                    if !rate_limit.should_retry_locally() {
+                        return Err(rate_limit.into());
+                    }
+                    Some(rate_limit.into())
+                } else {
+                    Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body))
+                };
                 transient_failures += 1;
                 if transient_failures >= legacy_max_retries {
                     break;
@@ -600,6 +631,12 @@ impl KiroProvider {
                         Some(&e.to_string()),
                         attempt_start,
                     );
+                    if is_rate_limit_error(&e) {
+                        return Err(e);
+                    }
+                    if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
+                        return Err(rate_limit);
+                    }
                     last_error = Some(e);
                     attempt += 1;
                     continue;
@@ -610,7 +647,7 @@ impl KiroProvider {
             let attempt = attempt_index;
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
-            self.ensure_profile_arn(&mut ctx).await;
+            self.ensure_profile_arn(&mut ctx).await?;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -699,6 +736,8 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let rate_limit_error = (status.as_u16() == 429)
+                .then(|| UpstreamRateLimitError::from_headers(response.headers()));
 
             // 成功响应
             if status.is_success() {
@@ -800,12 +839,9 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx.id)
-                        .await
-                        .is_ok()
-                    {
+                    if Self::handle_force_refresh_result(
+                        self.token_manager.force_refresh_token_for(ctx.id).await,
+                    )? {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -851,7 +887,12 @@ impl KiroProvider {
 
                     let remaining = self
                         .token_manager
-                        .report_account_throttled(ctx.id, cooldown);
+                        .report_account_throttled_for_request(
+                            ctx.id,
+                            cooldown,
+                            model.as_deref(),
+                            group,
+                        );
                     Self::emit_attempt(
                         sink,
                         attempt,
@@ -862,28 +903,16 @@ impl KiroProvider {
                         Some(&body),
                         attempt_start,
                     );
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败（账号级风控，凭据 #{} 已冷却 {} 分钟）: {} {}",
-                        api_type,
-                        ctx.id,
-                        cooldown_secs / 60,
-                        status,
-                        body
-                    ));
+                    let (rate_limit, must_wait_for_upstream) =
+                        account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
 
-                    if remaining == 0 {
-                        anyhow::bail!(
-                            "{} API 请求失败：所有凭据都处于账号风控冷却或已禁用状态。\
-                             上游对凭据 #{} 的账号触发了 \"suspicious activity\" 临时限速，\
-                             建议：(1) 增加更多不同 AWS 账号的凭据；\
-                             (2) 在管理面板降低冷却时长或手动解除冷却以重试；\
-                             (3) 提交 AWS Support 申诉解封该账号。原始响应: {} {}",
-                            api_type,
-                            ctx.id,
-                            status,
-                            body
-                        );
+                    if must_wait_for_upstream {
+                        return Err(rate_limit.into());
                     }
+                    if remaining == 0 {
+                        return Err(rate_limit.into());
+                    }
+                    last_error = Some(rate_limit.into());
                 } else {
                     tracing::warn!(
                         "API 请求失败（账号级风控，故障转移关闭，按瞬态限流重试，尝试 {}/{}）: {}",
@@ -901,12 +930,11 @@ impl KiroProvider {
                         Some(&body),
                         attempt_start,
                     );
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
-                        status,
-                        body
-                    ));
+                    let rate_limit = rate_limit_error.expect("429 必须包含限流错误上下文");
+                    if !rate_limit.should_retry_locally() {
+                        return Err(rate_limit.into());
+                    }
+                    last_error = Some(rate_limit.into());
                     transient_failures += 1;
                     if transient_failures >= legacy_max_retries {
                         break;
@@ -982,12 +1010,11 @@ impl KiroProvider {
                     attempt_start,
                 );
                 tried_in_round.insert(ctx.id);
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                let rate_limit = rate_limit_error.expect("429 必须包含限流错误上下文");
+                if !rate_limit.should_retry_locally() {
+                    return Err(rate_limit.into());
+                }
+                last_error = Some(rate_limit.into());
                 continue;
             }
 
@@ -1011,12 +1038,19 @@ impl KiroProvider {
                     Some(&body),
                     attempt_start,
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = if let Some(rate_limit) = rate_limit_error {
+                    if !rate_limit.should_retry_locally() {
+                        return Err(rate_limit.into());
+                    }
+                    Some(rate_limit.into())
+                } else {
+                    Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ))
+                };
                 transient_failures += 1;
                 if transient_failures >= legacy_max_retries {
                     break;
@@ -1149,5 +1183,123 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 返回是否刷新成功；类型化刷新 429 原样传播，其他刷新失败交回调用方按认证失败处理。
+    fn handle_force_refresh_result(result: anyhow::Result<()>) -> anyhow::Result<bool> {
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) if is_rate_limit_error(&error) => Err(error),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+fn is_rate_limit_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UpstreamRateLimitError>().is_some()
+}
+
+fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {
+    if last_error
+        .as_ref()
+        .is_some_and(|error| error.downcast_ref::<UpstreamRateLimitError>().is_some())
+    {
+        last_error.take()
+    } else {
+        None
+    }
+}
+
+/// 为账号风控 429 补齐本地冷却时间，并区分上游是否明确要求等待。
+fn account_rate_limit_with_fallback(
+    rate_limit: Option<UpstreamRateLimitError>,
+    cooldown_secs: u64,
+) -> (UpstreamRateLimitError, bool) {
+    let must_wait_for_upstream = rate_limit
+        .as_ref()
+        .is_some_and(|error| !error.should_retry_locally());
+    let error = match rate_limit {
+        Some(error) if error.retry_after().is_some() => error,
+        _ => UpstreamRateLimitError::new(Some(cooldown_secs.to_string())),
+    };
+    (error, must_wait_for_upstream)
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_typed_rate_limit_when_later_credential_selection_fails() {
+        let mut last_error = Some(anyhow::Error::new(UpstreamRateLimitError::new(Some(
+            "45".to_string(),
+        ))));
+
+        // A concurrent request may cool the final credential before the next acquisition.
+        // The earlier upstream 429 must win over the later generic selection failure.
+        let returned = take_rate_limit_error(&mut last_error)
+            .unwrap_or_else(|| anyhow::anyhow!("所有凭据均已禁用"));
+
+        let rate_limit = returned
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("应保留最初的类型化 429");
+        assert_eq!(rate_limit.retry_after(), Some("45"));
+        assert!(last_error.is_none());
+    }
+
+    #[test]
+    fn does_not_relabel_generic_error_as_rate_limit() {
+        let mut last_error = Some(anyhow::anyhow!("所有凭据均已禁用"));
+        assert!(take_rate_limit_error(&mut last_error).is_none());
+        assert!(last_error.is_some());
+    }
+
+    #[test]
+    fn account_rate_limit_uses_cooldown_when_retry_after_is_missing() {
+        let (error, must_wait) = account_rate_limit_with_fallback(
+            Some(UpstreamRateLimitError::new(None)),
+            300,
+        );
+
+        assert_eq!(error.retry_after(), Some("300"));
+        assert!(!must_wait, "无上游等待值时仍可按账号冷却策略故障转移");
+    }
+
+    #[test]
+    fn account_rate_limit_honors_explicit_upstream_retry_after() {
+        let (error, must_wait) = account_rate_limit_with_fallback(
+            Some(UpstreamRateLimitError::new(Some("90".to_string()))),
+            300,
+        );
+
+        assert_eq!(error.retry_after(), Some("90"));
+        assert!(must_wait, "上游明确要求等待时不得在内部提前重试");
+    }
+
+    #[test]
+    fn force_refresh_rate_limit_is_propagated_instead_of_counted_as_auth_failure() {
+        let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("60".to_string())));
+        let returned = KiroProvider::handle_force_refresh_result(Err(error))
+            .expect_err("强制刷新 429 应立即传播");
+
+        let rate_limit = returned
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("应保留类型化 429");
+        assert_eq!(rate_limit.retry_after(), Some("60"));
+    }
+
+    #[test]
+    fn generic_force_refresh_failure_remains_an_auth_failure() {
+        let outcome = KiroProvider::handle_force_refresh_result(Err(anyhow::anyhow!(
+            "invalid refresh token",
+        )))
+        .unwrap();
+        assert!(!outcome);
+    }
+
+    #[test]
+    fn current_acquire_rate_limit_is_detected_before_outer_retry() {
+        let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
+        assert!(is_rate_limit_error(&error));
     }
 }

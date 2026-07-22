@@ -373,7 +373,7 @@ export interface ClientKeyItem {
   group?: string
   /** 每分钟请求数上限；未设置表示不限速 */
   rpmLimit?: number
-  /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
+  /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
 }
 

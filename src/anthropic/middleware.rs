@@ -115,7 +115,7 @@ impl AppState {
 
 /// API Key 认证中间件
 ///
-/// 鉴权顺序：master apiKey → 客户端 Key（`csk_*`）。命中后向请求扩展注入
+/// 所有入口 Key 统一按已存储的完整值精确匹配，不限制前缀。命中后向请求扩展注入
 /// [`KeyContext`]，供 handler 记录用量时使用。
 pub async fn auth_middleware(
     State(state): State<AppState>,
@@ -130,7 +130,6 @@ pub async fn auth_middleware(
         }
     };
 
-    // 所有 Key 统一走客户端 Key 管理器校验
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify(&presented) {
             let rpm_limit = mgr.rpm_limit_of(id);

@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-rs"
-version = "0.6.10"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1061,6 +1061,7 @@ dependencies = [
  "futures",
  "hex",
  "http",
+ "httpdate",
  "image",
  "mime_guess",
  "parking_lot",
