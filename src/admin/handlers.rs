@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
-    Json,
 };
 use bytes::Bytes;
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
@@ -22,11 +22,12 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
-        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
-        SetLogGovernanceConfigRequest, SetPriorityRequest, SetUpdateConfigRequest,
-        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
-        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        CreateClientKeyResponse, GlobalProxyResponse, ModelTestRequest,
+        SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
+        UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -151,6 +152,27 @@ pub async fn get_credential_models(
     match state.service.get_available_models(id).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => e.into_http_response(),
+    }
+}
+
+/// GET /api/admin/models
+/// 使用账号池当前选中的可用凭据实时查询上游模型列表。
+pub async fn get_current_models(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_current_available_models().await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_http_response(),
+    }
+}
+
+/// POST /api/admin/models/test
+/// 使用所选模型发送真实的最小化 Kiro 请求。
+pub async fn test_model(
+    State(state): State<AdminState>,
+    Json(request): Json<ModelTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_model(request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_http_response(),
     }
 }
 
