@@ -80,6 +80,9 @@ pub struct CredentialStatusItem {
     /// 余额缓存的更新时间（Unix 秒，仅在 balance 有值时返回）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_updated_at: Option<f64>,
+    /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -490,6 +493,28 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+}
+
+/// 单账号 RPM 限流配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRpmLimitConfigResponse {
+    /// 是否启用单账号 RPM 主动限流
+    pub enabled: bool,
+    /// 每账号每分钟请求次数上限
+    pub limit: u32,
+}
+
+/// 更新单账号 RPM 限流配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountRpmLimitConfigRequest {
+    /// 是否启用限流；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 每分钟上限；缺省表示不修改，1..=100000
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// 自愈治理配置响应

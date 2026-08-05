@@ -4,6 +4,56 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.5] - 2026-08-05
+
+主题：**为多账号调度加入单账号 RPM 主动限流，并集中增强管理端的凭据筛选、批量操作、创建时间、请求计费与移动端可用性**。本版同时加固 WebSearch MCP 的查询参数兼容和 Enterprise / IdC 路由；新增配置默认关闭或带有 `serde(default)`，旧 `config.json` 与 `credentials.json` 无需迁移。
+
+### ✨ 新功能 — 单账号 RPM 主动限流
+
+> 来源：[PR #55](https://github.com/ZyphrZero/kiro.rs/pull/55)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- **每凭据独立滑动窗口**：新增 `accountRpmLimitEnabled`（默认 `false`）与 `accountRpmLimit`（默认 `60`），每个账号独立维护 60 秒请求窗口；达到上限后临时退出候选，请求自动故障转移到下一可用账号。
+- **只统计真实业务请求**：Admin 模型发现等只读操作不占用额度；配置可通过 `GET|PUT /api/admin/config/account-rpm-limit` 在运行时读取、修改并持久化。
+- **并发额度原子预留**：过期清理、上限校验与请求记账在同一把凭据锁内完成；并发请求竞争失败时重新选择账号，不会同时穿透只读检查而超过配置上限。
+- **标准 429 响应**：所有匹配账号都耗尽 RPM 时返回类型化 HTTP 429，并按最早释放的滑动窗口计算 `Retry-After`，不再退化为“所有凭据均已禁用”的通用错误。
+- **完整管理端设置**：顶栏提供启停、常用预设与自定义每分钟上限；移动端与桌面端复用同一配置面板。
+
+### ✨ 增强 — 凭据列表与批量操作
+
+> 来源：[PR #56](https://github.com/ZyphrZero/kiro.rs/pull/56) 与 [PR #58](https://github.com/ZyphrZero/kiro.rs/pull/58)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- **多字段排序**：支持按优先级、成功次数、累计失败、最后使用时间与 ID 排序；重复选择同一字段可切换升降序，“从未使用”始终排在末尾，同值使用 ID 稳定排序。
+- **按状态隐藏**：可组合隐藏当前优先、已启用、已禁用、冷却中和已超额凭据；排序或筛选变化后自动回到第一页。
+- **排序与拖拽语义隔离**：仅“手动顺序”允许拖拽调整优先级，字段排序期间隐藏拖拽手柄，避免视觉顺序与服务端优先级混淆。
+- **批量删除进度与失败重试**：逐项展示删除进度和最终成功/失败统计；部分失败时仅保留失败凭据的选择状态，方便直接重试，并确保异常路径也会退出删除中状态。
+- **记录凭据添加时间**：凭据新增可选 RFC3339 `createdAt`，所有新增入口统一补写，导入数据已有时间则保留；旧凭据无值时显示“未知”，无需迁移存量文件。
+
+### 📊 增强 — 请求计费与缓存效率
+
+> 来源：[PR #60](https://github.com/ZyphrZero/kiro.rs/pull/60)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- **Trace 详情新增计费面板**：展示上游 `meteringEvent` 的真实 credit、每千输入 Token 的 credit，以及缓存创建、缓存读取和未缓存输入等拆分指标。
+- **修正计费效率分母**：每千输入 credit 使用“未缓存输入 + cache creation + cache read”的总输入作为分母；存在缓存拆分时单独展示未缓存输入，避免高缓存命中请求被计算成异常高成本。
+
+### 🔧 修复 — WebSearch MCP 路由加固
+
+> 来源：[PR #57](https://github.com/ZyphrZero/kiro.rs/pull/57)。提交人：[@soeric](https://github.com/soeric)，感谢贡献。
+
+- **兼容多种查询入参**：统一提取 `query`、`search_query`、`q`、`queries` 及嵌套 `text` / `value`，自动去除首尾空白并选择首个非空查询。
+- **区分空结果与真实失败**：缺少有效查询时不调用 MCP；上游明确返回“无结果”时作为空搜索继续，其它 MCP 错误仍显式传播，不伪装为成功。
+- **Enterprise / IdC 搜索可用**：纯 MCP / WebSearch 请求在调用前补齐 `profileArn`，与常规模型请求保持一致，同时继续遵守客户端 Key 的凭据分组隔离。
+
+### 📱 修复 — 移动端管理体验
+
+- **客户端 Key 操作列固定**：宽表横向滚动时最后的编辑、启停、重置与删除操作列始终固定在右侧，并使用实体背景和边界避免内容透叠。
+- **自愈与限流选项不再缺失**：移动端紧凑菜单展示完整的自愈开关、403 封禁识别、冷却间隔、连续轮数、RPM 开关、预设和自定义上限。
+- **长菜单适配动态视口**：顶部工具菜单限制在移动端动态视口内并支持纵向滚动，避免浏览器地址栏或短屏裁掉底部配置。
+
+### 🔒 兼容性与测试
+
+- RPM 限流默认关闭；新增配置与 `createdAt` 均兼容旧文件，升级不改变现有账号的默认调度行为。
+- 新增 WebSearch 查询规范化、MCP 空结果、RPM 滑动窗口与 429、凭据添加时间等回归测试；Rust 全量测试与 Admin UI 类型检查、生产构建均通过。
+
 ## [0.7.4] - 2026-07-28
 
 主题：**修复 IdC / Enterprise 重新登录后 Token 无法刷新，以及持续 403 场景下“全账号自愈”陷入 `全禁 → 自愈 → 403 → 再禁` 死循环的问题**。本版合并 [PR #52](https://github.com/ZyphrZero/kiro.rs/pull/52) 与 [issue #51](https://github.com/ZyphrZero/kiro.rs/issues/51) 的修复：重新登录会整体替换与 OIDC 客户端绑定的凭据；账号池则精准识别 403 封禁，并通过配置驱动的**节流 + 连续上限 + 可观测**治理自愈行为。新增配置字段均 `serde(default)`，旧 `config.json` 无需改动。
