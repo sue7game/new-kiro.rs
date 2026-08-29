@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::client_keys::{KeyAuth, SharedClientKeyManager};
 use crate::admin::rate_limit::{RateLimitDecision, SharedRateLimiter};
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
@@ -140,17 +140,28 @@ pub async fn auth_middleware(
                     return rate_limit_response(retry_after_secs);
                 }
             }
-            if !mgr.touch(id) {
-                let error = ErrorResponse::authentication_error();
-                return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+            match mgr.verify_and_touch_ex(&presented) {
+                KeyAuth::Ok(id) => {
+                    let group = mgr.group_of(id);
+                    request.extensions_mut().insert(KeyContext {
+                        key_id: id,
+                        group,
+                        key_source: TraceKeySource::ClientKey,
+                    });
+                    return next.run(request).await;
+                }
+                KeyAuth::OverLimit { used, limit, .. } => {
+                    let error = ErrorResponse::new(
+                        "rate_limit_error",
+                        format!(
+                            "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
+                            used, limit
+                        ),
+                    );
+                    return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+                }
+                KeyAuth::NotFound => {}
             }
-            let group = mgr.group_of(id);
-            request.extensions_mut().insert(KeyContext {
-                key_id: id,
-                group,
-                key_source: TraceKeySource::ClientKey,
-            });
-            return next.run(request).await;
         }
     }
 

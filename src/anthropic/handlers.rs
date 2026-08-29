@@ -179,6 +179,9 @@ impl RequestTracer {
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
     pub fn mark_first_token(&self) {
+        if !self.is_stream {
+            return;
+        }
         let mut slot = self.first_token_at.lock();
         if slot.is_none() {
             *slot = Some(Instant::now());
@@ -229,14 +232,19 @@ impl RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
-    fn on_attempt(&self, attempt: TraceAttempt) {
-        self.attempts.lock().push(attempt);
+    fn on_attempt(&self, mut attempt: TraceAttempt) {
+        let mut attempts = self.attempts.lock();
+        // Each provider call numbers retries from zero. A web-search request can make
+        // several provider calls under one trace, so assign a request-wide sequence
+        // before persisting to the (trace_id, attempt) primary key.
+        attempt.attempt = attempts.len() as u32;
+        attempts.push(attempt);
     }
 }
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
-fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+pub(crate) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
     Some(canonical_attempt_outcome(&last))
 }
@@ -533,7 +541,7 @@ fn aggregate_available_models_with_custom(
 }
 
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
-    aggregate_available_models_with_custom(upstream_models, crate::model::custom_models::all())
+    aggregate_available_models_with_custom(upstream_models, &crate::model::custom_models::all())
 }
 
 /// GET /v1/models
@@ -681,10 +689,19 @@ pub async fn post_messages(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -796,8 +813,11 @@ pub async fn post_messages(
         )
         .await
     } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        // Responses reasoning requests must expose native reasoning even when the
+        // global Anthropic compatibility flag is disabled; the Responses adapter
+        // explicitly opted into it via `thinking`/`output_config`.
+        let extract_thinking =
+            (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
@@ -911,10 +931,11 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
+    let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -925,7 +946,7 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            tracer.mark_first_token();
+                            settlement.tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
@@ -952,58 +973,56 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
+                            settlement.update(&ctx, sent_bytes);
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束（记为 error）
-                            let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "error");
+                            // 流已开始后无法修改 HTTP 状态码。关闭已打开的内容块并发送
+                            // Anthropic error 终态，不能用正常 message_stop 掩盖上游断流。
+                            let final_events = ctx.generate_error_events(
+                                "upstream_error",
+                                "Upstream response stream was interrupted",
+                            );
+                            settlement.update(&ctx, sent_bytes);
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
-                            tracer.finalize(
+                            settlement.finish(
+                                "error",
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
                                 Some(&e.to_string()),
                                 Some(sent_bytes),
-                                stream_trace_usage(&ctx),
                             );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
                         }
                         None => {
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
+                            settlement.update(&ctx, sent_bytes);
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
-                                record_stream_usage(&hook, &ctx, credential_id, "error");
-                                tracer.finalize(
+                                settlement.finish(
+                                    "error",
                                     "error",
                                     Some(outcome::BAD_REQUEST),
                                     Some(&message),
                                     None,
-                                    stream_trace_usage(&ctx),
                                 );
                             } else {
-                                record_stream_usage(&hook, &ctx, credential_id, "success");
-                                tracer.finalize(
-                                    "success",
-                                    None,
-                                    None,
-                                    None,
-                                    stream_trace_usage(&ctx),
-                                );
+                                settlement.finish("success", "success", None, None, None);
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
                         }
                     }
                 }
@@ -1011,7 +1030,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
                 }
             }
         },
@@ -1021,24 +1040,93 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 从 StreamContext 提取最终用量并写入 hook
-fn record_stream_usage(
-    hook: &UsageRecordHook,
-    ctx: &StreamContext,
+/// Exactly-once settlement for a live Messages stream.
+///
+/// Responses consumes this stream as an inner body. If the outer client goes
+/// away, dropping that body also drops the in-flight unfold future; `Drop`
+/// records the latest usage snapshot and closes the trace instead of losing
+/// already incurred provider usage.
+struct StreamSettlement {
+    hook: UsageRecordHook,
     credential_id: u64,
-    status: &str,
-) {
-    // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
-    let (input, cache_creation, cache_read) = ctx.resolved_usage();
-    hook.record(
-        credential_id,
-        input,
-        ctx.resolved_output_tokens(),
-        cache_creation,
-        cache_read,
-        ctx.credits,
-        status,
-    );
+    tracer: std::sync::Arc<RequestTracer>,
+    usage: TraceUsage,
+    sent_bytes: u64,
+    settled: bool,
+}
+
+impl StreamSettlement {
+    fn new(
+        hook: UsageRecordHook,
+        credential_id: u64,
+        tracer: std::sync::Arc<RequestTracer>,
+        ctx: &StreamContext,
+    ) -> Self {
+        Self {
+            hook,
+            credential_id,
+            tracer,
+            usage: stream_trace_usage(ctx),
+            sent_bytes: 0,
+            settled: false,
+        }
+    }
+
+    fn update(&mut self, ctx: &StreamContext, sent_bytes: u64) {
+        self.usage = stream_trace_usage(ctx);
+        self.sent_bytes = sent_bytes;
+    }
+
+    fn finish(
+        &mut self,
+        usage_status: &str,
+        trace_status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        interrupted_after_bytes: Option<u64>,
+    ) {
+        if self.settled {
+            return;
+        }
+        self.record_usage(usage_status);
+        self.tracer.finalize(
+            trace_status,
+            error_type,
+            error_message,
+            interrupted_after_bytes,
+            self.usage,
+        );
+        self.settled = true;
+    }
+
+    fn record_usage(&self, status: &str) {
+        self.hook.record(
+            self.credential_id,
+            self.usage.input_tokens.min(i32::MAX as u64) as i32,
+            self.usage.output_tokens.min(i32::MAX as u64) as i32,
+            self.usage.cache_creation_tokens.min(i32::MAX as u64) as i32,
+            self.usage.cache_read_tokens.min(i32::MAX as u64) as i32,
+            self.usage.credits,
+            status,
+        );
+    }
+}
+
+impl Drop for StreamSettlement {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.record_usage("error");
+        self.tracer.finalize(
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some("response stream was cancelled before completion"),
+            Some(self.sent_bytes),
+            self.usage,
+        );
+        self.settled = true;
+    }
 }
 
 /// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
@@ -1590,10 +1678,19 @@ pub async fn post_messages_cc(
         tracing::info!(
             "detected mixed tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
+            tracer,
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
@@ -1934,6 +2031,198 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::config::ToolCompatibilityMode;
+
+    #[test]
+    fn dropped_stream_settles_latest_usage_exactly_once() {
+        let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+        let state = AppState::new(false, ToolCompatibilityMode::Raw).with_usage(
+            None,
+            None,
+            Some(aggregator.clone()),
+        );
+        let hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: KeyContext {
+                    key_id: 0,
+                    group: None,
+                    key_source: TraceKeySource::MasterApiKey,
+                },
+                model: "test-model".to_string(),
+                is_stream: true,
+            },
+        ));
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            11,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        ctx.output_tokens = 7;
+        ctx.credits = 0.5;
+
+        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx);
+        settlement.update(&ctx, 123);
+        drop(settlement);
+
+        let overview = aggregator.overview();
+        assert_eq!(overview.today_calls, 1);
+        assert_eq!(overview.today_errors, 1);
+        assert_eq!(overview.today_input_tokens, 11);
+        assert_eq!(overview.today_output_tokens, 7);
+        assert_eq!(overview.today_credits, 0.5);
+    }
+
+    #[test]
+    fn tracer_renumbers_attempts_across_provider_rounds_before_persisting() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "gpt-websearch-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 7,
+            key_source: TraceKeySource::ClientKey,
+            model: "gpt-5.6-luna".to_string(),
+            is_stream: false,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        let attempt = |attempt, credential_id, outcome: &str| TraceAttempt {
+            attempt,
+            credential_id,
+            endpoint: "ide".to_string(),
+            http_status: Some(200),
+            outcome: outcome.to_string(),
+            error_snippet: None,
+            duration_ms: 10,
+        };
+
+        // First provider round reports local attempts 0,1; the next round starts at 0 again.
+        tracer.on_attempt(attempt(0, 11, outcome::TRANSIENT));
+        tracer.on_attempt(attempt(1, 12, outcome::SUCCESS));
+        tracer.on_attempt(attempt(0, 13, outcome::SUCCESS));
+        tracer.finalize(
+            "success",
+            None,
+            None,
+            None,
+            TraceUsage {
+                input_tokens: 101,
+                output_tokens: 23,
+                cache_creation_tokens: 7,
+                cache_read_tokens: 89,
+                credits: 0.25,
+            },
+        );
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            model: Some("gpt-5.6-luna".to_string()),
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.final_credential_id, 13);
+        assert_eq!(record.total_attempts, 3);
+        assert_eq!(
+            record
+                .attempts
+                .iter()
+                .map(|a| a.attempt)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(record.input_tokens, 101);
+        assert_eq!(record.output_tokens, 23);
+        assert_eq!(record.cache_creation_tokens, 7);
+        assert_eq!(record.cache_read_tokens, 89);
+        assert_eq!(record.credits, 0.25);
+    }
+
+    #[test]
+    fn tracer_only_marks_first_token_for_streaming_requests() {
+        let mut tracer = RequestTracer {
+            store: None,
+            trace_id: "first-token-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "claude-sonnet-4".to_string(),
+            is_stream: false,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        tracer.mark_first_token();
+        assert!(tracer.first_token_at.lock().is_none());
+
+        tracer.is_stream = true;
+        tracer.mark_first_token();
+        let first = *tracer.first_token_at.lock();
+        assert!(first.is_some());
+
+        tracer.mark_first_token();
+        assert_eq!(*tracer.first_token_at.lock(), first);
+    }
+
+    #[test]
+    fn tracer_uses_terminal_mcp_attempt_for_failure_fields() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        let tracer = RequestTracer {
+            store: Some(store.clone()),
+            trace_id: "mcp-failure-trace".to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+            model: "claude-sonnet-4".to_string(),
+            is_stream: true,
+            started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        };
+        let attempt = |credential_id, endpoint: &str, status, attempt_outcome: &str| TraceAttempt {
+            attempt: 0,
+            credential_id,
+            endpoint: endpoint.to_string(),
+            http_status: Some(status),
+            outcome: attempt_outcome.to_string(),
+            error_snippet: None,
+            duration_ms: 10,
+        };
+
+        tracer.on_attempt(attempt(11, "ide", 200, outcome::SUCCESS));
+        tracer.on_attempt(attempt(29, "cli", 503, outcome::TRANSIENT));
+        tracer.finalize(
+            "error",
+            last_attempt_outcome(&tracer),
+            Some("MCP request failed"),
+            None,
+            TraceUsage::zero(),
+        );
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        let record = &records[0];
+        assert_eq!(record.final_credential_id, 29);
+        assert_eq!(record.error_type.as_deref(), Some(outcome::TRANSIENT));
+        assert_eq!(record.total_attempts, 2);
+        assert_eq!(record.attempts[0].endpoint, "ide");
+        assert_eq!(record.attempts[1].endpoint, "cli");
+    }
 
     #[test]
     fn account_suspended_attempt_is_preserved_as_request_error_type() {

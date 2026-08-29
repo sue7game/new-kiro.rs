@@ -290,6 +290,10 @@ pub struct Config {
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
 
+    /// 凭据 metadata 的 JSON Schema。未配置时使用程序内置 schema。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_metadata_schema: Option<serde_json::Value>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -445,6 +449,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
+            credential_metadata_schema: None,
             config_path: None,
         }
     }

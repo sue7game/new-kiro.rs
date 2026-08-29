@@ -16,18 +16,52 @@ import {
 import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
-  useRotateClientKey,
+  useRotateClientKey, useSetClientKeyMaxCredits,
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
-import { extractErrorMessage } from '@/lib/utils'
+import { extractErrorMessage, formatCredits } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { PageHeader } from '@/components/console/page-header'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
   return n.toString()
+}
+
+/**
+ * 解析积分上限输入框：
+ * - 空字符串 → null（不限制）
+ * - 合法非负数 → number
+ * - 其它 → 'invalid'
+ */
+function parseMaxCreditsInput(raw: string): number | null | 'invalid' {
+  const t = raw.trim()
+  if (t === '') return null
+  const n = Number(t)
+  if (!Number.isFinite(n) || n < 0) return 'invalid'
+  return n
+}
+
+/** 渲染「已用积分 / 上限」列。无上限时仅显示已用量。 */
+function CreditsUsage({ used, max }: { used: number; max?: number }) {
+  if (max == null) {
+    return (
+      <span className="text-[12px] tabular-nums text-muted-foreground">
+        {formatCredits(used)} <span className="text-[11px]">/ 无限制</span>
+      </span>
+    )
+  }
+  const ratio = max > 0 ? used / max : 1
+  const over = used >= max
+  const color = over ? 'text-destructive' : ratio >= 0.8 ? 'text-amber-500' : 'text-foreground'
+  return (
+    <span className={`text-[12px] tabular-nums ${color}`} title={`已用 ${used} / 上限 ${max}`}>
+      {formatCredits(used)} <span className="text-[11px] text-muted-foreground">/ {formatCredits(max)}</span>
+    </span>
+  )
 }
 
 function formatRelative(ts?: string): string {
@@ -69,6 +103,7 @@ export function ClientKeysPage() {
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
   const rotateKey = useRotateClientKey()
+  const setMaxCredits = useSetClientKeyMaxCredits()
   const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
@@ -76,6 +111,7 @@ export function ClientKeysPage() {
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
   const [createRpmLimit, setCreateRpmLimit] = useState('')
+  const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -85,6 +121,7 @@ export function ClientKeysPage() {
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
   const [editRpmLimit, setEditRpmLimit] = useState('')
+  const [editMaxCredits, setEditMaxCredits] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -97,12 +134,18 @@ export function ClientKeysPage() {
       toast.error('RPM 上限必须是 0 或正整数')
       return
     }
+    const maxCredits = parseMaxCreditsInput(createMaxCredits)
+    if (maxCredits === 'invalid') {
+      toast.error('积分上限必须是非负数')
+      return
+    }
     try {
       const res = await createKey.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
         rpmLimit: parseRpmLimit(createRpmLimit),
+        maxCredits: maxCredits ?? undefined,
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -110,6 +153,7 @@ export function ClientKeysPage() {
       setCreateDesc('')
       setCreateGroup('')
       setCreateRpmLimit('')
+      setCreateMaxCredits('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -192,6 +236,7 @@ export function ClientKeysPage() {
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
     setEditRpmLimit(item.rpmLimit ? String(item.rpmLimit) : '')
+    setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
     setEditOpen(true)
   }
 
@@ -200,6 +245,11 @@ export function ClientKeysPage() {
     if (!editTarget) return
     if (hasInvalidRpmLimit(editRpmLimit)) {
       toast.error('RPM 上限必须是 0 或正整数')
+      return
+    }
+    const maxCredits = parseMaxCreditsInput(editMaxCredits)
+    if (maxCredits === 'invalid') {
+      toast.error('积分上限必须是非负数')
       return
     }
     try {
@@ -212,6 +262,11 @@ export function ClientKeysPage() {
           rpmLimit: parseRpmLimit(editRpmLimit) ?? 0,
         },
       })
+      // 仅在上限发生变化时才调用额度接口，避免无谓写入
+      const prev = editTarget.maxCredits ?? null
+      if (maxCredits !== prev) {
+        await setMaxCredits.mutateAsync({ id: editTarget.id, maxCredits })
+      }
       toast.success('已更新')
       setEditOpen(false)
     } catch (err) {
@@ -230,17 +285,17 @@ export function ClientKeysPage() {
 
   return (
     <div>
-      <div className="mb-6 flex items-end justify-between gap-4">
-        <div>
-          <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。
-          </p>
-        </div>
-        <Button onClick={() => setCreateOpen(true)} size="sm">
-          <Plus className="h-3.5 w-3.5" />新建 Key
-        </Button>
-      </div>
+      <PageHeader
+        className="mb-4"
+        icon={<KeyRound className="h-4 w-4" />}
+        title="客户端 Key"
+        description="分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。"
+        actions={
+          <Button onClick={() => setCreateOpen(true)} size="sm">
+            <Plus className="h-3.5 w-3.5" />新建 Key
+          </Button>
+        }
+      />
 
       {isLoading ? (
         <Card>
@@ -258,7 +313,7 @@ export function ClientKeysPage() {
           </CardContent>
         </Card>
       ) : (
-        <Card>
+        <Card className="overflow-hidden">
           <CardContent className="overflow-x-auto p-0">
             <table className="w-full min-w-[1040px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
@@ -272,6 +327,7 @@ export function ClientKeysPage() {
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
                   <th className="text-right font-medium px-4 py-3">输出</th>
+                  <th className="text-right font-medium px-4 py-3">积分 / 上限</th>
                   <th className="text-left font-medium px-4 py-3">最后使用</th>
                   <th className="sticky right-0 z-20 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
                     操作
@@ -338,6 +394,9 @@ export function ClientKeysPage() {
                     <td className="px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalInputTokens)}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalOutputTokens)}</td>
+                    <td className="px-4 py-3 text-right">
+                      <CreditsUsage used={k.totalCredits} max={k.maxCredits} />
+                    </td>
                     <td className="px-4 py-3 text-[12px] text-muted-foreground">
                       {formatRelative(k.lastUsedAt)}
                     </td>
@@ -448,6 +507,22 @@ export function ClientKeysPage() {
                 限制该 Key 每 60 秒可通过的请求数，覆盖 /v1 和 /cc/v1 的所有受鉴权接口。
               </p>
             </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">积分上限（可选）</label>
+              <Input
+                type="number"
+                min="0"
+                step="any"
+                inputMode="decimal"
+                placeholder="留空表示不限制"
+                value={createMaxCredits}
+                onChange={(e) => setCreateMaxCredits(e.target.value)}
+                disabled={createKey.isPending}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                累计使用的 credit 达到上限后，该 Key 的请求会被拒绝（HTTP 429）。重置统计后重新计费。
+              </p>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -518,7 +593,7 @@ export function ClientKeysPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称、描述、分组与 RPM 上限（不影响 Key 值与统计）</DialogDescription>
+            <DialogDescription>修改名称、描述、分组、RPM 与积分上限（不影响 Key 值与统计）</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleEditSave} className="space-y-3 py-2">
             <div>
@@ -557,10 +632,26 @@ export function ClientKeysPage() {
                 保存为空或 0 会清空该 Key 的 RPM 限制。
               </p>
             </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">积分上限</label>
+              <Input
+                type="number"
+                min="0"
+                step="any"
+                inputMode="decimal"
+                placeholder="留空表示不限制"
+                value={editMaxCredits}
+                onChange={(e) => setEditMaxCredits(e.target.value)}
+                disabled={updateKey.isPending || setMaxCredits.isPending}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
+              </p>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
-              <Button type="submit" disabled={updateKey.isPending}>
-                {updateKey.isPending ? '保存中…' : '保存'}
+              <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending}>
+                {updateKey.isPending || setMaxCredits.isPending ? '保存中…' : '保存'}
               </Button>
             </DialogFooter>
           </form>

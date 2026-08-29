@@ -286,7 +286,7 @@ pub fn map_model(model: &str) -> Option<String> {
 
     // 自定义模型表优先（大小写不敏感精确匹配），可新增或覆盖内置映射。
     if let Some(custom) = crate::model::custom_models::lookup(model) {
-        return Some(custom.backend_id.clone());
+        return Some(custom.backend_id);
     }
 
     normalize_claude_model(model).or_else(|| Some(model.to_string()))
