@@ -227,7 +227,7 @@ export function ModelsSection() {
 
       <SettingGroup
         title="会话粘性路由"
-        description="开启后同一会话的后续轮次优先沿用上一轮成功的账号；该账号不可用时才回落到负载均衡。上游 prompt cache 按 profile 隔离：账号同属一个 profile 时换号不丢缓存（凭据页顶部有标记），跨 profile 部署时粘性才真正保住缓存。"
+        description="开启后同一会话的后续轮次优先沿用上一轮成功的账号；该账号不可用时才回落到负载均衡。轮询模式保持逐请求换号，不使用会话粘性。上游 prompt cache 按 profile 隔离：账号同属一个 profile 时换号不丢缓存（凭据页顶部有标记），跨 profile 部署时粘性才真正保住缓存。"
       >
         <SettingSwitch
           label="同一会话优先沿用上一轮账号"

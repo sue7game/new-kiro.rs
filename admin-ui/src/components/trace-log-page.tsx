@@ -321,7 +321,7 @@ function StickyMarker({ rec, verbose = false }: { rec: TraceRecord; verbose?: bo
   if (kind === 'off') {
     return verbose ? (
       <span
-        title="会话粘性路由已关闭"
+        title="会话粘性未生效：已关闭或当前为轮询模式"
         className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border/60 px-1 py-px text-[10px] text-muted-foreground"
       >
         <Shuffle className="h-3 w-3" />

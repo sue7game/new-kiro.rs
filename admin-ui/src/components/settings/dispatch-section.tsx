@@ -54,7 +54,7 @@ function LoadBalancingGroup() {
           data?.mode === 'balanced'
             ? '按用量动态挑选凭据，把请求摊平到整个池子'
             : data?.mode === 'round-robin'
-              ? '同优先级凭据依次轮询，按分组和模型分别维护游标'
+              ? '同优先级凭据逐请求轮询，按分组和模型分别维护游标；不使用会话粘性'
             : '按优先级数字从小到大用：先用完 0 号，再换 1 号'
         }
         value={data?.mode ?? 'priority'}

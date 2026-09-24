@@ -2167,6 +2167,9 @@ impl MultiTokenManager {
 
     /// 记录「该凭据成功服务了该会话」，供下一轮粘性命中。
     pub fn bind_session(&self, session: &str, credential_id: u64) {
+        if self.load_balancing_mode.lock().as_str() == "round-robin" {
+            return;
+        }
         self.session_affinity.bind(session, credential_id);
     }
 
@@ -2192,6 +2195,10 @@ impl MultiTokenManager {
             return (None, RouteDecision::none());
         };
         if !self.session_affinity.is_enabled() {
+            return (None, RouteDecision::none());
+        }
+        // 轮询模式承诺逐请求换号，不能让会话粘性覆盖二开的轮询语义。
+        if self.load_balancing_mode.lock().as_str() == "round-robin" {
             return (None, RouteDecision::none());
         }
         let Some(bound_id) = self.session_affinity.lookup(session) else {
@@ -7894,6 +7901,36 @@ mod tests {
         assert_eq!(fallback.id, 2);
         assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
         assert_eq!(route.previous_credential_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_keeps_rotating_with_session_affinity_enabled() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "round-robin".to_string();
+        assert!(config.session_affinity_enabled);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("first", &[]), grouped_cred("second", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (first, first_route) = manager
+            .acquire_context_routed(None, None, Some("same-session"))
+            .await
+            .unwrap();
+        manager.bind_session("same-session", first.id);
+        let (second, second_route) = manager
+            .acquire_context_routed(None, None, Some("same-session"))
+            .await
+            .unwrap();
+
+        assert_eq!((first.id, second.id), (1, 2));
+        assert_eq!(first_route.sticky_outcome, StickyOutcome::Off);
+        assert_eq!(second_route.sticky_outcome, StickyOutcome::Off);
+        assert_eq!(manager.session_affinity().stats().active_bindings, 0);
     }
 
     #[tokio::test]

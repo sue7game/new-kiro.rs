@@ -190,6 +190,7 @@ pub struct Config {
     /// 不会丢缓存；粘性主要在多 profile 部署下保住缓存，单 profile 下作用是会话可追溯。
     /// 注意：粘性优先于 priority 模式的「高优先级恢复后立即回切」，代价是
     /// 会话在 TTL 内不会主动迁回高优先级凭据。
+    /// round-robin 模式保持逐请求轮询，不使用会话粘性。
     #[serde(default = "default_session_affinity_enabled")]
     pub session_affinity_enabled: bool,
 
