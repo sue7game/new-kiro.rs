@@ -340,6 +340,12 @@ pub async fn exchange_code_for_token(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
+        if super::is_invalid_grant_response(status, &body_text) {
+            return Err(super::OAuthGrantInvalidError {
+                message: "Social 授权码已失效，请重新登录",
+            }
+            .into());
+        }
         anyhow::bail!("Social token 交换失败 {}: {}", status, body_text);
     }
 

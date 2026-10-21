@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::auth::is_invalid_grant_response;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
@@ -204,13 +205,10 @@ async fn refresh_social_token(
             return Err(error.into());
         }
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
+        // 根据结构化错误码识别失效令牌，不依赖上游可变的英文描述。
+        if is_invalid_grant_response(status, &body_text) {
             return Err(RefreshTokenInvalidError {
-                message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: "Social refreshToken 已失效 (invalid_grant)".to_string(),
             }
             .into());
         }
@@ -307,13 +305,10 @@ async fn refresh_idc_token(
             return Err(error.into());
         }
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
+        // 根据结构化错误码识别失效令牌，不依赖上游可变的英文描述。
+        if is_invalid_grant_response(status, &body_text) {
             return Err(RefreshTokenInvalidError {
-                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: "IdC refreshToken 已失效 (invalid_grant)".to_string(),
             }
             .into());
         }
@@ -411,12 +406,9 @@ async fn refresh_external_idp_token(
 
         // invalid_grant → refreshToken 永久失效（Azure 返回
         // {"error":"invalid_grant","error_description":"..."}）
-        if status.as_u16() == 400 && body_text.contains("invalid_grant") {
+        if is_invalid_grant_response(status, &body_text) {
             return Err(RefreshTokenInvalidError {
-                message: format!(
-                    "External IdP refreshToken 已失效 (invalid_grant): {}",
-                    body_text
-                ),
+                message: "External IdP refreshToken 已失效 (invalid_grant)".to_string(),
             }
             .into());
         }
@@ -2165,12 +2157,20 @@ impl MultiTokenManager {
         .map(|(context, _, route)| (context, route))
     }
 
-    /// 记录「该凭据成功服务了该会话」，供下一轮粘性命中。
-    pub fn bind_session(&self, session: &str, credential_id: u64) {
+    /// 记录「该凭据成功服务了该分组内的会话」，供下一轮粘性命中。
+    pub fn bind_session(&self, session: &str, group: Option<&str>, credential_id: u64) {
         if self.load_balancing_mode.lock().as_str() == "round-robin" {
             return;
         }
-        self.session_affinity.bind(session, credential_id);
+        self.session_affinity
+            .bind(&Self::scoped_session_key(session, group), credential_id);
+    }
+
+    fn scoped_session_key(session: &str, group: Option<&str>) -> String {
+        match group {
+            Some(group) => format!("{}:{group}{session}", group.len()),
+            None => format!("*:{session}"),
+        }
     }
 
     /// 计入一次粘性判定结果（命中率统计）
@@ -2201,7 +2201,10 @@ impl MultiTokenManager {
         if self.load_balancing_mode.lock().as_str() == "round-robin" {
             return (None, RouteDecision::none());
         }
-        let Some(bound_id) = self.session_affinity.lookup(session) else {
+        let Some(bound_id) = self
+            .session_affinity
+            .lookup(&Self::scoped_session_key(session, group))
+        else {
             return (
                 None,
                 RouteDecision {
@@ -5017,6 +5020,28 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn invalid_grant_detection_uses_error_code_not_description() {
+        let bad_request = reqwest::StatusCode::BAD_REQUEST;
+        assert!(is_invalid_grant_response(
+            bad_request,
+            r#"{"error":"invalid_grant","error_description":"Token revoked"}"#,
+        ));
+        assert!(is_invalid_grant_response(
+            bad_request,
+            r#"{"error":"invalid_grant"}"#,
+        ));
+        assert!(!is_invalid_grant_response(
+            bad_request,
+            r#"{"error":"server_error","error_description":"invalid_grant mentioned"}"#,
+        ));
+        assert!(!is_invalid_grant_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"invalid_grant"}"#,
+        ));
+        assert!(!is_invalid_grant_response(bad_request, "invalid_grant"));
+    }
+
     /// 构造一个仅含单凭据、可配置 RPM 限流的测试用 manager。
     fn rpm_test_manager(enabled: bool, limit: u32) -> MultiTokenManager {
         let mut config = Config::default();
@@ -7793,7 +7818,7 @@ mod tests {
             .unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(route.sticky_outcome, StickyOutcome::MissFirst, "尚未 bind 过");
-        manager.bind_session("sess-A", 2);
+        manager.bind_session("sess-A", None, 2);
 
         // #1 恢复：不带会话的请求立刻回切 #1（既有 priority 语义不变）
         manager.set_disabled(1, false).unwrap();
@@ -7862,7 +7887,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.id, 1);
-        manager.bind_session("s", 1);
+        manager.bind_session("s", None, 1);
 
         // #1 RPM 已满（limit=1，上一次 acquire 已计入）→ 粘性不可用 → 落到 #2
         let (ctx, route) = manager
@@ -7884,7 +7909,7 @@ mod tests {
             false,
         )
         .unwrap();
-        manager.bind_session("retry-session", 1);
+        manager.bind_session("retry-session", None, 1);
 
         let (first, route) = manager
             .acquire_context_routed_excluding(None, None, Some("retry-session"), &HashSet::new())
@@ -7901,6 +7926,42 @@ mod tests {
         assert_eq!(fallback.id, 2);
         assert_eq!(route.sticky_outcome, StickyOutcome::MissUnavailable);
         assert_eq!(route.previous_credential_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_is_independent_per_client_key_group() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("group-a", &["A"]), grouped_cred("group-b", &["B"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.bind_session("shared-session", Some("A"), 1);
+
+        let (context, route) = manager
+            .acquire_context_routed(None, Some("B"), Some("shared-session"))
+            .await
+            .unwrap();
+
+        assert_eq!(context.id, 2);
+        assert_eq!(route.sticky_outcome, StickyOutcome::MissFirst);
+        assert_eq!(route.previous_credential_id, None);
+
+        manager.bind_session("shared-session", Some("B"), 2);
+        let (a_context, a_route) = manager
+            .acquire_context_routed(None, Some("A"), Some("shared-session"))
+            .await
+            .unwrap();
+        let (b_context, b_route) = manager
+            .acquire_context_routed(None, Some("B"), Some("shared-session"))
+            .await
+            .unwrap();
+        assert_eq!(a_context.id, 1);
+        assert_eq!(b_context.id, 2);
+        assert_eq!(a_route.sticky_outcome, StickyOutcome::Hit);
+        assert_eq!(b_route.sticky_outcome, StickyOutcome::Hit);
     }
 
     #[tokio::test]
@@ -7921,7 +7982,7 @@ mod tests {
             .acquire_context_routed(None, None, Some("same-session"))
             .await
             .unwrap();
-        manager.bind_session("same-session", first.id);
+        manager.bind_session("same-session", None, first.id);
         let (second, second_route) = manager
             .acquire_context_routed(None, None, Some("same-session"))
             .await

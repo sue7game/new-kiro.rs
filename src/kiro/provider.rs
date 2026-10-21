@@ -1057,7 +1057,7 @@ impl KiroProvider {
                     .report_success_for_request(ctx.id, model.as_deref());
                 // 上游接受了请求才把会话钉到这个凭据，失败的凭据不会被绑定
                 if let Some(session) = session_id.as_deref() {
-                    self.token_manager.bind_session(session, ctx.id);
+                    self.token_manager.bind_session(session, group, ctx.id);
                 }
                 return Ok(KiroCallResult {
                     response,

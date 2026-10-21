@@ -3121,6 +3121,14 @@ impl AdminService {
         if let Some(error) = classify_rate_limit(&e) {
             return error;
         }
+        if let Some(error) = e.downcast_ref::<crate::kiro::auth::OAuthGrantInvalidError>() {
+            return AdminServiceError::InvalidCredential(error.to_string());
+        }
+        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+            return AdminServiceError::InvalidCredential(
+                "refreshToken 已失效（invalid_grant），请重新登录后添加凭据".to_string(),
+            );
+        }
         let msg = e.to_string();
 
         // 凭据验证失败（refreshToken 无效、格式错误等）
@@ -3326,7 +3334,7 @@ impl AdminService {
             session.proxy.as_ref(),
         )
         .await
-        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        .map_err(|e| self.classify_add_error(e))?;
 
         // 重新登录模式：更新已有凭据而非创建新凭据
         if let Some(target_id) = session.relogin_target_id {
@@ -3359,7 +3367,7 @@ impl AdminService {
             .token_manager
             .add_credential(new_cred)
             .await
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            .map_err(|e| self.classify_add_error(e))?;
 
         // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
         if let Err(e) = self.get_balance(credential_id).await {
@@ -3564,7 +3572,7 @@ impl AdminService {
                 self.idc_sessions.lock().remove(session_id);
                 Ok(PollIdcLoginResponse::Expired)
             }
-            idc::PollResult::Error(e) => Err(AdminServiceError::InternalError(e.to_string())),
+            idc::PollResult::Error(e) => Err(self.classify_add_error(e)),
             idc::PollResult::Success(token) => {
                 self.idc_sessions.lock().remove(session_id);
 
@@ -3617,7 +3625,7 @@ impl AdminService {
                     .token_manager
                     .add_credential(new_cred)
                     .await
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                    .map_err(|e| self.classify_add_error(e))?;
 
                 // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
                 if let Err(e) = self.get_balance(credential_id).await {
@@ -3945,6 +3953,41 @@ mod tests {
         assert_eq!(
             classified.status_code(),
             axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn add_credential_invalid_grant_is_classified_as_bad_request() {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+
+        for channel in ["Social", "IdC", "External IdP"] {
+            let error = anyhow::Error::new(RefreshTokenInvalidError {
+                message: format!(
+                    "{} refreshToken 已失效 (invalid_grant): {{\"token\":\"private\"}}",
+                    channel
+                ),
+            });
+            let classified = service.classify_add_error(error);
+            assert_eq!(classified.status_code(), axum::http::StatusCode::BAD_REQUEST);
+            assert!(matches!(&classified, AdminServiceError::InvalidCredential(_)));
+            assert!(!classified.to_string().contains("private"));
+        }
+
+        for message in ["Social 授权码已失效，请重新登录", "IdC 设备授权已失效，请重新登录"] {
+            let classified = service.classify_add_error(anyhow::Error::new(
+                crate::kiro::auth::OAuthGrantInvalidError { message },
+            ));
+            assert_eq!(classified.status_code(), axum::http::StatusCode::BAD_REQUEST);
+            assert!(matches!(classified, AdminServiceError::InvalidCredential(_)));
+        }
+
+        let unrelated = service.classify_add_error(anyhow::anyhow!("数据库写入失败"));
+        assert_eq!(
+            unrelated.status_code(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

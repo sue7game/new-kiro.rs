@@ -133,39 +133,39 @@ pub async fn auth_middleware(
     };
 
     if let Some(mgr) = &state.client_keys {
-        if let Some(id) = mgr.verify(&presented) {
-            let rpm_limit = mgr.rpm_limit_of(id);
+        let auth = mgr.verify_and_touch_checked(&presented, |id, rpm_limit| {
             if let Some(limiter) = &state.rate_limiter {
-                if let RateLimitDecision::Limited { retry_after_secs } =
-                    limiter.check(id, rpm_limit)
+                if let RateLimitDecision::Limited { retry_after_secs } = limiter.check(id, rpm_limit)
                 {
-                    return rate_limit_response(retry_after_secs);
+                    return Err(retry_after_secs);
                 }
             }
-            match mgr.verify_and_touch_ex(&presented) {
-                KeyAuth::Ok(id) => {
-                    let group = mgr.group_of(id);
-                    let client_ip = auth::extract_client_ip(&request);
-                    request.extensions_mut().insert(KeyContext {
-                        key_id: id,
-                        group,
-                        key_source: TraceKeySource::ClientKey,
-                        client_ip,
-                    });
-                    return next.run(request).await;
-                }
-                KeyAuth::OverLimit { used, limit, .. } => {
-                    let error = ErrorResponse::new(
-                        "rate_limit_error",
-                        format!(
-                            "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
-                            used, limit
-                        ),
-                    );
-                    return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
-                }
-                KeyAuth::NotFound => {}
+            Ok(())
+        });
+        match auth {
+            Err(retry_after_secs) => return rate_limit_response(retry_after_secs),
+            Ok(KeyAuth::Ok(id)) => {
+                let group = mgr.group_of(id);
+                let client_ip = auth::extract_client_ip(&request);
+                request.extensions_mut().insert(KeyContext {
+                    key_id: id,
+                    group,
+                    key_source: TraceKeySource::ClientKey,
+                    client_ip,
+                });
+                return next.run(request).await;
             }
+            Ok(KeyAuth::OverLimit { used, limit, .. }) => {
+                let error = ErrorResponse::new(
+                    "rate_limit_error",
+                    format!(
+                        "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
+                        used, limit
+                    ),
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            }
+            Ok(KeyAuth::NotFound) => {}
         }
     }
 

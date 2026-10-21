@@ -183,7 +183,18 @@ pub async fn poll_token(
             "authorization_pending" => return PollResult::Pending,
             "slow_down" => return PollResult::Pending,
             "expired_token" => return PollResult::Expired,
-            "access_denied" => return PollResult::Error(anyhow::anyhow!("用户拒绝了授权请求")),
+            "access_denied" => {
+                return PollResult::Error(super::OAuthGrantInvalidError {
+                    message: "用户拒绝了授权请求",
+                }
+                .into())
+            }
+            "invalid_grant" if status == reqwest::StatusCode::BAD_REQUEST => {
+                return PollResult::Error(super::OAuthGrantInvalidError {
+                    message: "IdC 设备授权已失效，请重新登录",
+                }
+                .into())
+            }
             _ => {}
         }
     }

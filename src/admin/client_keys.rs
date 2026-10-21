@@ -501,16 +501,10 @@ impl ClientKeyManager {
 
     /// 校验 Key，命中且未禁用则返回 id；不更新使用统计。
     ///
-    /// RPM 限流需要先完成鉴权，再在允许通过后触发 `touch`，避免被拒绝的请求计入成功调用数。
+    /// 仅供不需要更新使用统计的调用方使用。
     pub fn verify(&self, presented: &str) -> Option<u64> {
         let inner = self.inner.read();
         find_active_key_id(&inner, presented)
-    }
-
-    /// 标记 Key 已通过一次请求，更新 `last_used_at`/`total_calls`。
-    pub fn touch(&self, id: u64) -> bool {
-        let mut inner = self.inner.write();
-        touch_entry(&mut inner, id)
     }
 
     /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`。
@@ -528,27 +522,38 @@ impl ClientKeyManager {
     /// 常量时间匹配所有启用 Key；命中后若已达积分上限则返回 [`KeyAuth::OverLimit`]，
     /// 否则累加调用次数并返回 [`KeyAuth::Ok`]。
     pub fn verify_and_touch_ex(&self, presented: &str) -> KeyAuth {
+        self.verify_and_touch_checked(presented, |_, _| Ok::<(), std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    /// 在积分检查之后、调用计数之前执行额外准入检查；拒绝时不改变调用统计。
+    pub fn verify_and_touch_checked<E>(
+        &self,
+        presented: &str,
+        check: impl FnOnce(u64, Option<u32>) -> Result<(), E>,
+    ) -> Result<KeyAuth, E> {
         let mut inner = self.inner.write();
         let Some(id) = find_active_key_id(&inner, presented) else {
-            return KeyAuth::NotFound;
+            return Ok(KeyAuth::NotFound);
         };
-        if let Some(entry) = inner.entries.get_mut(&id) {
+        if let Some(entry) = inner.entries.get(&id) {
             // 达到积分上限：拒绝，不累加调用次数
             if let Some(limit) = entry.max_credits {
                 if entry.total_credits >= limit {
-                    return KeyAuth::OverLimit {
+                    return Ok(KeyAuth::OverLimit {
                         id,
                         used: entry.total_credits,
                         limit,
-                    };
+                    });
                 }
             }
+            check(id, entry.rpm_limit)?;
         }
         if !touch_entry(&mut inner, id) {
-            return KeyAuth::NotFound;
+            return Ok(KeyAuth::NotFound);
         }
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
-        KeyAuth::Ok(id)
+        Ok(KeyAuth::Ok(id))
     }
 
     /// 设置或清除单个 Key 的积分使用上限。`None` 表示取消限制。
@@ -747,6 +752,33 @@ mod tests {
         mgr.record_usage(entry.id, 0, 0, 0, 0, 999.0);
         assert!(mgr.set_max_credits(entry.id, None));
         assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+    }
+
+    #[test]
+    fn credit_rejection_does_not_consume_key_rpm_or_call_count() {
+        use crate::admin::rate_limit::{RateLimitDecision, RateLimiter};
+
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create_with_rpm_limit("limited".to_string(), None, None, Some(1));
+        let limiter = RateLimiter::new();
+        let authorize = || {
+            mgr.verify_and_touch_checked(&entry.key, |id, rpm_limit| {
+                match limiter.check(id, rpm_limit) {
+                    RateLimitDecision::Allowed => Ok(()),
+                    RateLimitDecision::Limited { retry_after_secs } => Err(retry_after_secs),
+                }
+            })
+        };
+
+        assert!(mgr.set_max_credits(entry.id, Some(1.0)));
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 1.0);
+        assert!(matches!(authorize(), Ok(KeyAuth::OverLimit { .. })));
+        assert_eq!(mgr.list()[0].total_calls, 0);
+
+        assert!(mgr.reset_stats(entry.id));
+        assert_eq!(authorize(), Ok(KeyAuth::Ok(entry.id)));
+        assert!(authorize().is_err());
+        assert_eq!(mgr.list()[0].total_calls, 1);
     }
 
     #[test]
